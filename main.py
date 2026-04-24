@@ -251,17 +251,13 @@ def main():
     # Print initial status
     print_status(trader)
 
-    # Confirm before trading
+    # Auto-start on Railway (no stdin)
     if not args.dry_run:
-        print("\n⚠️  LIVE TRADING MODE ⚠️")
+        print("\n💩 LIVE TRADING MODE 💩")
         print(f"   Base bet: ${config.stink.base_bet_dollars:.2f}")
         print(f"   Next bet: ${trader.state.get_next_bet_amount(config.stink.base_bet_dollars):.2f}")
-        print("\n   Press Enter to start, or Ctrl+C to cancel...")
-        try:
-            input()
-        except KeyboardInterrupt:
-            print("\n💩 Cancelled")
-            sys.exit(0)
+        print("   Starting in 3 seconds...")
+        time.sleep(3)
 
     # Run trading loop
     run_trading_loop(trader, dry_run=args.dry_run, interval=args.interval)
