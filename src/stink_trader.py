@@ -314,22 +314,42 @@ class StinkTrader:
         self.log(f"    Bet #{self.state.bet_number} in round {self.state.round_number}")
 
         try:
-            print(f"💩 CALLING client.buy_no(ticker={market.ticker}, count={contracts}, price={limit_price})...")
-            # Place the order at limit_price (includes slippage buffer)
+            # Determine price to send
+            order_price = limit_price if not self.stink.use_market_orders else None
+            print(f"💩 CALLING client.buy_no(ticker={market.ticker}, count={contracts}, price={order_price})...")
+            print(f"💩 NOTE: use_market_orders={self.stink.use_market_orders}")
+
+            # Place the order
             order = self.client.buy_no(
                 ticker=market.ticker,
                 count=contracts,
-                price=limit_price if not self.stink.use_market_orders else None
+                price=order_price
             )
 
-            print(f"💩 ORDER RESPONSE:")
+            print(f"💩 INITIAL ORDER RESPONSE:")
             print(f"💩   order_id: {order.order_id}")
             print(f"💩   status: {order.status}")
             print(f"💩   filled_count: {order.filled_count}")
+            print(f"💩   remaining_count: {order.remaining_count}")
 
             self.log(f"    Order placed: {order.order_id}")
             self.log(f"    Status: {order.status}")
             self.log(f"    Filled: {order.filled_count}")
+
+            # Verify fill status (wait up to 3 seconds for confirmation)
+            if order.order_id:
+                print(f"💩 VERIFYING ORDER FILL...")
+                filled, verified_order = self.client.verify_order_filled(order.order_id, max_wait=3.0)
+                if verified_order:
+                    order = verified_order
+                    print(f"💩 VERIFIED ORDER STATUS: {order.status}, filled={order.filled_count}")
+                    self.log(f"    Verified: {order.status}, filled={order.filled_count}")
+                else:
+                    print(f"💩 COULD NOT VERIFY ORDER")
+
+                if not filled:
+                    print(f"💩 WARNING: Order may not be fully filled!")
+                    print(f"💩 Status: {order.status}, filled_count={order.filled_count}, remaining={order.remaining_count}")
 
             # Record the trade (use cost_price as entry, that's what we expect to pay)
             record = TradeRecord(

@@ -33,7 +33,7 @@ class StinkConfig:
     sweet_spot_max: int = 15   # cents - ideal range end
 
     # 💩 Quadratic betting
-    base_bet_dollars: float = 1.0  # Starting bet amount
+    base_bet_dollars: float = 0.5  # Starting bet amount
     # Bet progression: base * 1, base * 2, base * 3, base * 4...
 
     # 💩 Timing
@@ -44,7 +44,7 @@ class StinkConfig:
     max_loss_streak_abort: int = 30  # Stop trading if we hit this streak (shouldn't happen)
 
     # 💩 Order execution
-    use_market_orders: bool = True  # Market orders fill immediately
+    use_market_orders: bool = False  # False = limit orders (like Corbeezy), True = market orders
 
 
 @dataclass
@@ -89,9 +89,9 @@ def load_config() -> AppConfig:
         max_entry_price=int(os.getenv("MAX_ENTRY_PRICE", "20")),
         sweet_spot_min=int(os.getenv("SWEET_SPOT_MIN", "10")),
         sweet_spot_max=int(os.getenv("SWEET_SPOT_MAX", "15")),
-        base_bet_dollars=float(os.getenv("BASE_BET_DOLLARS", "1.0")),
+        base_bet_dollars=float(os.getenv("BASE_BET_DOLLARS", "0.5")),
         bet_immediately=os.getenv("BET_IMMEDIATELY", "true").lower() == "true",
-        use_market_orders=os.getenv("USE_MARKET_ORDERS", "true").lower() == "true",
+        use_market_orders=os.getenv("USE_MARKET_ORDERS", "false").lower() == "true",
     )
 
     kalshi = KalshiConfig(

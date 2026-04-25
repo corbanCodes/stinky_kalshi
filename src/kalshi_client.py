@@ -121,13 +121,22 @@ class KalshiClient:
         )
         self.session = requests.Session()
 
-    def _request(self, method: str, path: str, params: dict = None, data: dict = None) -> dict:
+    def _request(self, method: str, path: str, params: dict = None, data: dict = None, debug: bool = False) -> dict:
         """Make authenticated request to Kalshi API."""
         url = f"{self.config.api_url}{path}"
         body = json.dumps(data) if data else ""
 
         full_path = f"/trade-api/v2{path}"
         headers = self.auth.get_auth_headers(method, full_path, body)
+
+        if debug:
+            print(f"💩 API REQUEST DEBUG:")
+            print(f"💩   Method: {method}")
+            print(f"💩   URL: {url}")
+            print(f"💩   Path (for auth): {full_path}")
+            print(f"💩   Params: {params}")
+            print(f"💩   Body: {body}")
+            print(f"💩   Headers (partial): Content-Type={headers.get('Content-Type')}")
 
         response = self.session.request(
             method=method,
@@ -137,9 +146,19 @@ class KalshiClient:
             data=body if data else None,
         )
 
+        if debug:
+            print(f"💩 API RESPONSE DEBUG:")
+            print(f"💩   Status Code: {response.status_code}")
+            print(f"💩   Response Text: {response.text[:500] if response.text else 'EMPTY'}")
+
         if response.status_code == 429:
+            print(f"💩 RATE LIMITED - waiting 1s and retrying...")
             time.sleep(1)
-            return self._request(method, path, params, data)
+            return self._request(method, path, params, data, debug)
+
+        if response.status_code >= 400:
+            print(f"💩 API ERROR: {response.status_code}")
+            print(f"💩 Response: {response.text}")
 
         response.raise_for_status()
         return response.json() if response.text else {}
@@ -206,6 +225,10 @@ class KalshiClient:
         order_type: str = "market",
     ) -> OrderResponse:
         """Place an order."""
+        print(f"💩 ========== PLACE_ORDER CALLED ==========")
+        print(f"💩 PARAMS: ticker={ticker}, side={side}, action={action}")
+        print(f"💩 PARAMS: count={count}, price={price}, order_type={order_type}")
+
         data = {
             "ticker": ticker,
             "side": side,
@@ -219,13 +242,39 @@ class KalshiClient:
                 data["yes_price"] = price
             else:
                 data["no_price"] = price
+            print(f"💩 LIMIT ORDER: Adding {side}_price = {price}")
+        elif order_type == "market":
+            print(f"💩 MARKET ORDER: No price needed")
+        else:
+            print(f"💩 WARNING: order_type={order_type} but price={price}")
 
-        response = self._request("POST", "/portfolio/orders", data=data)
-        return OrderResponse.from_api(response)
+        print(f"💩 FINAL ORDER DATA: {json.dumps(data, indent=2)}")
+
+        try:
+            response = self._request("POST", "/portfolio/orders", data=data, debug=True)
+            print(f"💩 ORDER RESPONSE RAW: {json.dumps(response, indent=2)}")
+
+            order_response = OrderResponse.from_api(response)
+            print(f"💩 ORDER PARSED:")
+            print(f"💩   order_id: {order_response.order_id}")
+            print(f"💩   status: {order_response.status}")
+            print(f"💩   filled_count: {order_response.filled_count}")
+            print(f"💩   remaining_count: {order_response.remaining_count}")
+
+            return order_response
+
+        except Exception as e:
+            print(f"💩 ORDER EXCEPTION: {type(e).__name__}: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
 
     def buy_no(self, ticker: str, count: int, price: int = None) -> OrderResponse:
         """💩 Buy NO contracts (our stinky longshot bet) 💩"""
         order_type = "limit" if price else "market"
+        print(f"💩 ========== BUY_NO CALLED ==========")
+        print(f"💩 ticker={ticker}, count={count}, price={price}")
+        print(f"💩 order_type determined: {order_type}")
         return self.place_order(ticker, "no", "buy", count, price, order_type)
 
     def get_orders(self, status: str = None, ticker: str = None) -> list[OrderResponse]:
@@ -237,6 +286,52 @@ class KalshiClient:
             params["ticker"] = ticker
         data = self._request("GET", "/portfolio/orders", params=params)
         return [OrderResponse.from_api(o) for o in data.get("orders", [])]
+
+    def get_order(self, order_id: str) -> OrderResponse:
+        """Get single order by ID."""
+        print(f"💩 GET_ORDER: Fetching order {order_id}")
+        data = self._request("GET", f"/portfolio/orders/{order_id}")
+        print(f"💩 GET_ORDER RESPONSE: {json.dumps(data, indent=2)}")
+        return OrderResponse.from_api(data)
+
+    def verify_order_filled(self, order_id: str, max_wait: float = 5.0) -> tuple[bool, OrderResponse]:
+        """
+        Verify an order has been filled. Returns (filled, order_response).
+        Waits up to max_wait seconds for fill confirmation.
+        """
+        print(f"💩 VERIFYING ORDER FILL: {order_id}")
+        start = time.time()
+
+        while time.time() - start < max_wait:
+            try:
+                order = self.get_order(order_id)
+                print(f"💩 ORDER STATUS: {order.status}, filled={order.filled_count}/{order.count}")
+
+                if order.status == "executed":
+                    print(f"💩 ORDER FULLY EXECUTED!")
+                    return True, order
+                elif order.status == "canceled":
+                    print(f"💩 ORDER WAS CANCELED!")
+                    return False, order
+                elif order.status == "resting":
+                    print(f"💩 ORDER IS RESTING (limit order waiting)")
+                elif order.filled_count > 0:
+                    print(f"💩 PARTIAL FILL: {order.filled_count}/{order.count}")
+
+                time.sleep(0.5)
+            except Exception as e:
+                print(f"💩 ERROR CHECKING ORDER: {e}")
+                time.sleep(0.5)
+
+        # Final check
+        try:
+            order = self.get_order(order_id)
+            filled = order.status == "executed" or order.filled_count == order.count
+            print(f"💩 FINAL CHECK: status={order.status}, filled={filled}")
+            return filled, order
+        except Exception as e:
+            print(f"💩 FINAL CHECK ERROR: {e}")
+            return False, None
 
     def get_positions(self) -> list[dict]:
         """Get current positions."""

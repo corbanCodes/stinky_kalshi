@@ -517,7 +517,7 @@ HTML_TEMPLATE = """
                 <input type="number" id="baseBetInput" value="1.00" step="0.01" min="0.25" max="100"
                     style="width:70px;padding:8px;border-radius:6px;border:1px solid #333;background:#1a1a2e;color:#00ff88;font-size:1em;font-weight:bold;"
                     oninput="onBaseBetInput()" onfocus="onBaseBetInput()" onkeydown="if(event.key==='Enter'){setBaseBet();event.preventDefault();}">
-                <button class="btn" onclick="setBaseBet()" style="background:#666;padding:8px 15px;">Set</button>
+                <button class="btn" onclick="setBaseBet()" style="background:#00aa55;color:#fff;padding:8px 15px;font-weight:bold;">Set</button>
                 <span id="baseBetStatus" style="color:#00ff88;font-size:0.8em;"></span>
             </div>
             <div style="display:flex;align-items:center;gap:6px;">
@@ -711,27 +711,24 @@ HTML_TEMPLATE = """
             const rawValue = input.value;
             const val = parseFloat(rawValue);
 
-            console.log('💩 setBaseBet called');
-            console.log('💩 input.value (raw):', rawValue);
-            console.log('💩 parseFloat result:', val);
-            statusEl.textContent = '...';
+            // Show immediate feedback
+            statusEl.textContent = 'Setting...';
             statusEl.style.color = '#ffaa00';
 
             if (isNaN(val)) {
-                console.log('💩 REJECTED: val is NaN');
                 statusEl.textContent = '❌ Invalid';
                 statusEl.style.color = '#ff4444';
+                alert('Invalid number: ' + rawValue);
                 return;
             }
 
             if (val < 0.25 || val > 100) {
-                console.log('💩 REJECTED: val out of range:', val);
                 statusEl.textContent = '❌ $0.25-$100';
                 statusEl.style.color = '#ff4444';
+                alert('Base bet must be between $0.25 and $100');
                 return;
             }
 
-            console.log('💩 SENDING to server:', {base_bet: val});
             skipInputUpdate = true;
 
             try {
@@ -741,27 +738,26 @@ HTML_TEMPLATE = """
                     body: JSON.stringify({base_bet: val})
                 });
                 const data = await res.json();
-                console.log('💩 SERVER RESPONSE:', data);
 
                 if (data.status === 'ok') {
                     input.value = data.base_bet.toFixed(2);
                     document.getElementById('base').textContent = '$' + data.base_bet.toFixed(2);
-                    statusEl.textContent = '✓ Set!';
+                    statusEl.textContent = '✓ $' + data.base_bet.toFixed(2);
                     statusEl.style.color = '#00ff88';
-                    console.log('💩 SUCCESS: base_bet set to', data.base_bet);
-                    setTimeout(() => { statusEl.textContent = ''; }, 2000);
+                    // Keep the success message visible
+                    setTimeout(() => { statusEl.textContent = ''; }, 5000);
                 } else {
-                    console.log('💩 SERVER ERROR:', data);
                     statusEl.textContent = '❌ Error';
                     statusEl.style.color = '#ff4444';
+                    alert('Server error: ' + (data.message || 'Unknown'));
                 }
             } catch (err) {
-                console.log('💩 FETCH ERROR:', err);
                 statusEl.textContent = '❌ Failed';
                 statusEl.style.color = '#ff4444';
+                alert('Network error: ' + err.message);
             }
 
-            setTimeout(() => { skipInputUpdate = false; }, 2000);
+            setTimeout(() => { skipInputUpdate = false; }, 3000);
             fetchStatus();
         }
 
