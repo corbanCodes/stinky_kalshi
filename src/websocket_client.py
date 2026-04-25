@@ -264,41 +264,29 @@ class KalshiWebSocket:
             print(f"💩 Unsubscribe failed: {e}")
             return False
 
-    def _parse_orderbook_data(self, data: dict, ticker: str):
+    def _parse_orderbook_data(self, data: dict, ticker: str, is_delta: bool = False):
         """
         Parse orderbook snapshot or delta.
 
-        Kalshi format: {"orderbook": {"yes": [[price, qty], ...], "no": [[price, qty], ...]}}
-        Or directly: {"yes": [[price, qty], ...], "no": [[price, qty], ...]}
+        Snapshot format: {"yes_dollars_fp": [[price, qty], ...], "no_dollars_fp": [[price, qty], ...]}
+        Delta format: {"price_dollars": "0.45", "delta_fp": "10", "side": "yes"}
         """
         ob = self.orderbooks.get(ticker, Orderbook(ticker=ticker))
 
-        # Debug: log the data structure for first few updates
-        if ob.update_count < 3:
-            print(f"💩 DEBUG orderbook data keys: {list(data.keys())}")
-            if "orderbook" in data:
-                print(f"💩 DEBUG orderbook inner keys: {list(data['orderbook'].keys())}")
-
-        # Handle nested "orderbook" key
-        orderbook_data = data.get("orderbook", data)
-
         def parse_levels(levels_data) -> list[OrderbookLevel]:
-            """Parse price levels from various formats."""
+            """Parse price levels from [[price, qty], ...] format."""
             result = []
             if not isinstance(levels_data, list):
                 return result
 
             for level in levels_data:
                 if len(level) >= 2:
-                    # Handle both cents (int) and dollars (float/string)
                     price_raw = level[0]
                     qty_raw = level[1]
 
-                    # Convert price to cents
-                    if isinstance(price_raw, str):
-                        price = int(float(price_raw) * 100) if '.' in price_raw else int(price_raw)
-                    elif isinstance(price_raw, float):
-                        price = int(price_raw * 100) if price_raw < 1.01 else int(price_raw)
+                    # Convert price to cents (prices come as dollars like 0.45)
+                    if isinstance(price_raw, (str, float)):
+                        price = int(float(price_raw) * 100)
                     else:
                         price = int(price_raw)
 
@@ -310,17 +298,51 @@ class KalshiWebSocket:
 
             return result
 
-        # Parse YES bids (check multiple possible keys)
-        for key in ["yes", "yes_dollars", "bids"]:
-            if key in orderbook_data:
-                ob.yes_bids = parse_levels(orderbook_data[key])
-                break
+        if is_delta:
+            # Delta format: single price level change
+            side = data.get("side", "")
+            price_raw = data.get("price_dollars", 0)
+            delta_raw = data.get("delta_fp", 0)
 
-        # Parse NO bids
-        for key in ["no", "no_dollars"]:
-            if key in orderbook_data:
-                ob.no_bids = parse_levels(orderbook_data[key])
-                break
+            price = int(float(price_raw) * 100) if price_raw else 0
+            delta = int(float(delta_raw)) if delta_raw else 0
+
+            if side == "yes" and 1 <= price <= 99:
+                # Update or add the level
+                found = False
+                for level in ob.yes_bids:
+                    if level.price == price:
+                        level.quantity = max(0, level.quantity + delta)
+                        found = True
+                        break
+                if not found and delta > 0:
+                    ob.yes_bids.append(OrderbookLevel(price=price, quantity=delta))
+                # Remove zero-quantity levels
+                ob.yes_bids = [l for l in ob.yes_bids if l.quantity > 0]
+
+            elif side == "no" and 1 <= price <= 99:
+                found = False
+                for level in ob.no_bids:
+                    if level.price == price:
+                        level.quantity = max(0, level.quantity + delta)
+                        found = True
+                        break
+                if not found and delta > 0:
+                    ob.no_bids.append(OrderbookLevel(price=price, quantity=delta))
+                ob.no_bids = [l for l in ob.no_bids if l.quantity > 0]
+
+        else:
+            # Snapshot format: full orderbook replacement
+            # Check for yes_dollars_fp / no_dollars_fp keys
+            for key in ["yes_dollars_fp", "yes_dollars", "yes"]:
+                if key in data:
+                    ob.yes_bids = parse_levels(data[key])
+                    break
+
+            for key in ["no_dollars_fp", "no_dollars", "no"]:
+                if key in data:
+                    ob.no_bids = parse_levels(data[key])
+                    break
 
         ob.last_update = time.time()
         ob.update_count += 1
@@ -344,11 +366,12 @@ class KalshiWebSocket:
             if msg_type in ("orderbook_snapshot", "orderbook_delta"):
                 msg = data.get("msg", {})
                 ticker = msg.get("market_ticker", "")
+                is_delta = (msg_type == "orderbook_delta")
 
                 if ticker:
-                    ob = self._parse_orderbook_data(msg, ticker)
+                    ob = self._parse_orderbook_data(msg, ticker, is_delta=is_delta)
                     if self._message_count <= 10:
-                        print(f"💩 Orderbook update: {ticker} NO_ask={ob.no_ask}¢")
+                        print(f"💩 Orderbook {msg_type}: {ticker} NO_ask={ob.no_ask}¢ yes_bids={len(ob.yes_bids)}")
 
                     if self.on_orderbook_update:
                         self.on_orderbook_update(ob)
