@@ -54,6 +54,7 @@ class MarketData:
     volume: int
     status: str
     close_time: str
+    open_time: str = ""
     floor_strike: float = 0.0
 
     @classmethod
@@ -79,8 +80,31 @@ class MarketData:
             volume=int(float(market.get("volume_24h_fp", market.get("volume_24h", "0")) or "0")),
             status=market.get("status", ""),
             close_time=market.get("close_time", ""),
+            open_time=market.get("open_time", ""),
             floor_strike=float(market.get("floor_strike", 0) or 0),
         )
+
+    def is_currently_active(self) -> bool:
+        """Check if market is currently tradeable based on time."""
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+
+        try:
+            # Parse ISO format times
+            if self.open_time:
+                open_dt = datetime.fromisoformat(self.open_time.replace('Z', '+00:00'))
+                if now < open_dt:
+                    return False  # Not open yet
+
+            if self.close_time:
+                close_dt = datetime.fromisoformat(self.close_time.replace('Z', '+00:00'))
+                if now > close_dt:
+                    return False  # Already closed
+
+            return True  # Between open and close
+        except Exception:
+            # Fall back to status check
+            return self.status in ("active", "open", "trading")
 
 
 class KalshiClient:

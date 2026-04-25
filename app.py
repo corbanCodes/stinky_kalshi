@@ -93,20 +93,62 @@ async def refresh_market_subscriptions():
     global rest_client, ws_client
 
     try:
-        log_activity("Fetching BTC 15-min markets...")
         markets = rest_client.get_btc_15min_markets()
-        log_activity(f"Found {len(markets)} total markets")
 
-        # Log each market's status for debugging
+        # Use time-based filtering - check if market is currently tradeable
+        from datetime import datetime, timezone, timedelta
+        now = datetime.now(timezone.utc)
+
+        # On first fetch, log detailed timing info
+        if len(ws_client.subscribed_tickers) == 0 and markets:
+            log_activity(f"Current UTC time: {now.isoformat()}")
+            # Show closest markets by time
+            timed_markets = []
+            for m in markets[:20]:
+                if m.open_time and m.close_time:
+                    try:
+                        open_dt = datetime.fromisoformat(m.open_time.replace('Z', '+00:00'))
+                        close_dt = datetime.fromisoformat(m.close_time.replace('Z', '+00:00'))
+                        diff = (open_dt - now).total_seconds()
+                        timed_markets.append((m, open_dt, close_dt, diff))
+                    except:
+                        pass
+
+            timed_markets.sort(key=lambda x: abs(x[3]))
+            for m, open_dt, close_dt, diff in timed_markets[:5]:
+                status_emoji = "✅" if m.is_currently_active() else "⏳"
+                log_activity(f"  {status_emoji} {m.ticker}: open={open_dt.strftime('%H:%M')} close={close_dt.strftime('%H:%M')} (diff={diff/60:.1f}min)")
+
+        active_markets = [m for m in markets if m.is_currently_active()]
+
+        # Also include markets that WILL be active soon (next 2 minutes) for upcoming windows
+        upcoming_cutoff = now + timedelta(minutes=2)
+
         for m in markets:
-            log_activity(f"  Market: {m.ticker} status={m.status} no_ask={m.no_ask}¢")
+            if m not in active_markets and m.open_time:
+                try:
+                    open_dt = datetime.fromisoformat(m.open_time.replace('Z', '+00:00'))
+                    if now <= open_dt <= upcoming_cutoff:
+                        active_markets.append(m)
+                except:
+                    pass
 
-        # Accept "open" or "active" status
-        active_tickers = {m.ticker for m in markets if m.status in ("open", "active", "trading")}
-        log_activity(f"Found {len(active_tickers)} tradeable markets")
+        active_tickers = {m.ticker for m in active_markets}
+
+        # Log status summary (not every market)
+        status_counts = {}
+        for m in markets:
+            status_counts[m.status] = status_counts.get(m.status, 0) + 1
+
+        log_activity(f"Markets: {len(markets)} total, {len(active_tickers)} active/upcoming. Statuses: {status_counts}")
+
+        # Log the active ones
+        if active_markets:
+            for m in active_markets[:5]:  # Log first 5 max
+                log_activity(f"  Active: {m.ticker} open={m.open_time} close={m.close_time}")
 
         if not active_tickers:
-            log_activity("No tradeable BTC 15-min markets found")
+            # No active markets - this is normal between trading windows
             return
 
         # Unsubscribe from closed markets
@@ -127,7 +169,8 @@ async def refresh_market_subscriptions():
                     log_activity(f"Failed to subscribe to {ticker}", "loss")
                 await asyncio.sleep(0.1)
 
-        log_activity(f"Subscribed to {new_count} new markets (total: {len(ws_client.subscribed_tickers)})", "win" if new_count > 0 else "")
+        if new_count > 0:
+            log_activity(f"Subscribed to {new_count} new markets (total: {len(ws_client.subscribed_tickers)})", "win")
 
     except Exception as e:
         import traceback
@@ -144,7 +187,7 @@ async def ws_main_loop():
 
     reconnect_delay = 1
     last_refresh = 0
-    refresh_interval = 60  # Check for new markets every 60s
+    refresh_interval = 30  # Check for new markets every 30s (15-min markets cycle quickly)
 
     while is_ws_running:
         try:
