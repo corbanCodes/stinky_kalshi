@@ -514,9 +514,11 @@ HTML_TEMPLATE = """
         <div class="controls">
             <div style="display:flex;align-items:center;gap:8px;">
                 <label style="color:#888;font-size:0.85em;">Base Bet: $</label>
-                <input type="number" id="baseBetInput" value="1.00" step="0.25" min="0.25" max="100"
-                    style="width:70px;padding:8px;border-radius:6px;border:1px solid #333;background:#1a1a2e;color:#00ff88;font-size:1em;font-weight:bold;">
+                <input type="number" id="baseBetInput" value="1.00" step="0.01" min="0.25" max="100"
+                    style="width:70px;padding:8px;border-radius:6px;border:1px solid #333;background:#1a1a2e;color:#00ff88;font-size:1em;font-weight:bold;"
+                    oninput="onBaseBetInput()" onfocus="onBaseBetInput()" onkeydown="if(event.key==='Enter'){setBaseBet();event.preventDefault();}">
                 <button class="btn" onclick="setBaseBet()" style="background:#666;padding:8px 15px;">Set</button>
+                <span id="baseBetStatus" style="color:#00ff88;font-size:0.8em;"></span>
             </div>
             <div style="display:flex;align-items:center;gap:6px;">
                 <input type="checkbox" id="slippageCheck" onchange="toggleSlippage()" style="width:18px;height:18px;cursor:pointer;">
@@ -694,24 +696,38 @@ HTML_TEMPLATE = """
         async function stop() { await fetch('/api/stop', {method:'POST'}); fetchStatus(); }
 
         let skipInputUpdate = false;
+        let inputUpdateTimeout = null;
+
+        function onBaseBetInput() {
+            // Prevent status updates from overwriting user input for 3 seconds
+            skipInputUpdate = true;
+            if (inputUpdateTimeout) clearTimeout(inputUpdateTimeout);
+            inputUpdateTimeout = setTimeout(() => { skipInputUpdate = false; }, 3000);
+        }
+
         async function setBaseBet() {
             const input = document.getElementById('baseBetInput');
+            const statusEl = document.getElementById('baseBetStatus');
             const rawValue = input.value;
             const val = parseFloat(rawValue);
 
             console.log('💩 setBaseBet called');
             console.log('💩 input.value (raw):', rawValue);
             console.log('💩 parseFloat result:', val);
+            statusEl.textContent = '...';
+            statusEl.style.color = '#ffaa00';
 
             if (isNaN(val)) {
                 console.log('💩 REJECTED: val is NaN');
-                alert('Invalid number');
+                statusEl.textContent = '❌ Invalid';
+                statusEl.style.color = '#ff4444';
                 return;
             }
 
             if (val < 0.25 || val > 100) {
                 console.log('💩 REJECTED: val out of range:', val);
-                alert('Base bet must be between $0.25 and $100');
+                statusEl.textContent = '❌ $0.25-$100';
+                statusEl.style.color = '#ff4444';
                 return;
             }
 
@@ -730,16 +746,22 @@ HTML_TEMPLATE = """
                 if (data.status === 'ok') {
                     input.value = data.base_bet.toFixed(2);
                     document.getElementById('base').textContent = '$' + data.base_bet.toFixed(2);
+                    statusEl.textContent = '✓ Set!';
+                    statusEl.style.color = '#00ff88';
                     console.log('💩 SUCCESS: base_bet set to', data.base_bet);
+                    setTimeout(() => { statusEl.textContent = ''; }, 2000);
                 } else {
                     console.log('💩 SERVER ERROR:', data);
-                    alert(data.message || 'Failed to set base bet');
+                    statusEl.textContent = '❌ Error';
+                    statusEl.style.color = '#ff4444';
                 }
             } catch (err) {
                 console.log('💩 FETCH ERROR:', err);
+                statusEl.textContent = '❌ Failed';
+                statusEl.style.color = '#ff4444';
             }
 
-            setTimeout(() => { skipInputUpdate = false; }, 1000);
+            setTimeout(() => { skipInputUpdate = false; }, 2000);
             fetchStatus();
         }
 
