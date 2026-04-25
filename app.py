@@ -36,6 +36,8 @@ ws_loop = None
 # State flags
 is_trading = False
 is_ws_running = False
+use_slippage = True  # Default ON: add 3¢ buffer to limit orders
+SLIPPAGE_CENTS = 3
 
 # Activity log
 activity_log = []
@@ -223,49 +225,128 @@ def trading_loop():
     global is_trading, trader, ws_client
 
     log_activity("Trading started! 💩", "win")
+    loop_count = 0
 
     while is_trading:
         try:
+            loop_count += 1
+
+            # Log every 10 loops to show we're alive
+            if loop_count % 10 == 1:
+                print(f"💩 TRADE LOOP #{loop_count}: is_trading={is_trading}, ws_connected={ws_client.is_connected if ws_client else False}")
+                print(f"💩 TRADE CONFIG: range={trader.stink.min_entry_price}-{trader.stink.max_entry_price}¢, base_bet=${trader.stink.base_bet_dollars:.2f}")
+                print(f"💩 TRADE STATE: balance=${trader.balance:.2f}, bet_number={trader.state.bet_number}, already_bet_on={list(trader._bet_tickers)}")
+
             trader.check_settlements()
 
             # Use WebSocket orderbooks for opportunities
-            if ws_client and ws_client.is_connected:
-                opportunities = ws_client.get_stinky_opportunities(
-                    min_price=trader.stink.min_entry_price,
-                    max_price=trader.stink.max_entry_price
-                )
+            if not ws_client:
+                print(f"💩 TRADE SKIP: ws_client is None")
+                time.sleep(1)
+                continue
 
-                if opportunities and trader.can_afford_bet():
-                    opportunities.sort(key=lambda ob: ob.no_ask or 999)
-                    best = opportunities[0]
+            if not ws_client.is_connected:
+                print(f"💩 TRADE SKIP: WebSocket not connected")
+                time.sleep(1)
+                continue
 
-                    if best.ticker not in trader._bet_tickers:
-                        market = MarketData(
-                            ticker=best.ticker,
-                            yes_bid=best.best_yes_bid or 0,
-                            yes_ask=best.yes_ask or 0,
-                            no_bid=best.best_no_bid or 0,
-                            no_ask=best.no_ask or 0,
-                            volume=0,
-                            status="open",
-                            close_time="",
-                        )
-                        result = trader.execute_stink_bet(market)
-                        if result:
-                            log_activity(f"BET: {result.ticker} @ {result.entry_price}¢ (${result.bet_amount:.2f})", "win")
+            # Get all orderbooks
+            all_obs = list(ws_client.orderbooks.values())
+            if not all_obs:
+                if loop_count % 10 == 1:
+                    print(f"💩 TRADE SKIP: No orderbooks available")
+                time.sleep(1)
+                continue
 
-                elif not trader.can_afford_bet():
-                    bet_amount = trader.state.get_next_bet_amount(trader.stink.base_bet_dollars)
-                    log_activity(f"Cannot afford ${bet_amount:.2f}", "loss")
-                    is_trading = False
-                    break
+            # Log ALL orderbook prices every 10 loops
+            if loop_count % 10 == 1:
+                for ob in all_obs:
+                    in_range = trader.stink.min_entry_price <= (ob.no_ask or 999) <= trader.stink.max_entry_price
+                    print(f"💩 ORDERBOOK: {ob.ticker} NO_ask={ob.no_ask}¢ YES_ask={ob.yes_ask}¢ IN_RANGE={in_range}")
+
+            # Check for opportunities
+            opportunities = ws_client.get_stinky_opportunities(
+                min_price=trader.stink.min_entry_price,
+                max_price=trader.stink.max_entry_price
+            )
+
+            if not opportunities:
+                if loop_count % 10 == 1:
+                    print(f"💩 TRADE: No opportunities in range {trader.stink.min_entry_price}-{trader.stink.max_entry_price}¢")
+                time.sleep(1)
+                continue
+
+            # Found opportunities!
+            print(f"💩 FOUND {len(opportunities)} STINKY OPPORTUNITIES!")
+            for opp in opportunities:
+                print(f"💩   -> {opp.ticker} NO_ask={opp.no_ask}¢")
+
+            # Check if we can afford
+            can_afford = trader.can_afford_bet()
+            next_bet = trader.state.get_next_bet_amount(trader.stink.base_bet_dollars)
+            print(f"💩 AFFORD CHECK: can_afford={can_afford}, next_bet=${next_bet:.2f}, balance=${trader.balance:.2f}")
+
+            if not can_afford:
+                log_activity(f"Cannot afford ${next_bet:.2f}", "loss")
+                print(f"💩 STOPPING: Cannot afford next bet")
+                is_trading = False
+                break
+
+            # Sort and get best
+            opportunities.sort(key=lambda ob: ob.no_ask or 999)
+            best = opportunities[0]
+            print(f"💩 BEST OPPORTUNITY: {best.ticker} @ {best.no_ask}¢")
+
+            # Check if already bet on this ticker
+            if best.ticker in trader._bet_tickers:
+                print(f"💩 SKIP: Already bet on {best.ticker}")
+                time.sleep(1)
+                continue
+
+            # EXECUTE THE BET!
+            # Apply slippage buffer if enabled
+            actual_no_ask = best.no_ask or 0
+            limit_price = actual_no_ask + SLIPPAGE_CENTS if use_slippage else actual_no_ask
+
+            print(f"💩 ========== EXECUTING BET ==========")
+            print(f"💩 TICKER: {best.ticker}")
+            print(f"💩 NO_ASK: {actual_no_ask}¢")
+            print(f"💩 SLIPPAGE: {'ON +' + str(SLIPPAGE_CENTS) + '¢' if use_slippage else 'OFF'}")
+            print(f"💩 LIMIT_PRICE: {limit_price}¢")
+            print(f"💩 BET_AMOUNT: ${next_bet:.2f}")
+            print(f"💩 CONTRACTS: {int((next_bet * 100) / actual_no_ask) if actual_no_ask else 0}")
+
+            market = MarketData(
+                ticker=best.ticker,
+                yes_bid=best.best_yes_bid or 0,
+                yes_ask=best.yes_ask or 0,
+                no_bid=best.best_no_bid or 0,
+                no_ask=limit_price,  # Use limit price with slippage
+                volume=0,
+                status="open",
+                close_time="",
+            )
+
+            result = trader.execute_stink_bet(market, actual_entry=actual_no_ask)
+
+            if result:
+                print(f"💩 ========== BET PLACED ==========")
+                print(f"💩 RESULT: {result}")
+                log_activity(f"BET: {result.ticker} @ {result.entry_price}¢ (${result.bet_amount:.2f})", "win")
+            else:
+                print(f"💩 ========== BET FAILED ==========")
+                print(f"💩 execute_stink_bet returned None")
 
             time.sleep(1)
 
         except Exception as e:
+            import traceback
+            print(f"💩 TRADING ERROR: {e}")
+            traceback.print_exc()
             log_activity(f"Trading error: {e}", "loss")
             time.sleep(5)
 
+    print(f"💩 TRADING LOOP ENDED: is_trading={is_trading}")
     log_activity("Trading stopped")
 
 
@@ -437,6 +518,10 @@ HTML_TEMPLATE = """
                     style="width:70px;padding:8px;border-radius:6px;border:1px solid #333;background:#1a1a2e;color:#00ff88;font-size:1em;font-weight:bold;">
                 <button class="btn" onclick="setBaseBet()" style="background:#666;padding:8px 15px;">Set</button>
             </div>
+            <div style="display:flex;align-items:center;gap:6px;">
+                <input type="checkbox" id="slippageCheck" onchange="toggleSlippage()" style="width:18px;height:18px;cursor:pointer;">
+                <label for="slippageCheck" style="color:#888;font-size:0.85em;cursor:pointer;">+3¢ slippage buffer</label>
+            </div>
             <button id="startBtn" class="btn btn-start" onclick="start()">▶️ START</button>
             <button id="stopBtn" class="btn btn-stop" onclick="stop()" disabled>⏹️ STOP</button>
         </div>
@@ -540,11 +625,13 @@ HTML_TEMPLATE = """
             document.getElementById('bets').textContent = d.state.total_bets;
             document.getElementById('base').textContent = '$' + d.config.base_bet.toFixed(2);
             document.getElementById('range').textContent = d.config.entry_range;
-            // Update input field if not focused
+            // Update input field if not focused and not recently set
             const input = document.getElementById('baseBetInput');
-            if (document.activeElement !== input) {
+            if (document.activeElement !== input && !skipInputUpdate) {
                 input.value = d.config.base_bet.toFixed(2);
             }
+            // Sync slippage checkbox
+            document.getElementById('slippageCheck').checked = d.config.use_slippage;
 
             // WS stats
             document.getElementById('subCnt').textContent = d.ws.subscribed_count + ' mkts';
@@ -605,16 +692,66 @@ HTML_TEMPLATE = """
 
         async function start() { await fetch('/api/start', {method:'POST'}); fetchStatus(); }
         async function stop() { await fetch('/api/stop', {method:'POST'}); fetchStatus(); }
+
+        let skipInputUpdate = false;
         async function setBaseBet() {
-            const val = parseFloat(document.getElementById('baseBetInput').value);
-            if (val >= 0.25 && val <= 100) {
-                await fetch('/api/set_base_bet', {
+            const input = document.getElementById('baseBetInput');
+            const rawValue = input.value;
+            const val = parseFloat(rawValue);
+
+            console.log('💩 setBaseBet called');
+            console.log('💩 input.value (raw):', rawValue);
+            console.log('💩 parseFloat result:', val);
+
+            if (isNaN(val)) {
+                console.log('💩 REJECTED: val is NaN');
+                alert('Invalid number');
+                return;
+            }
+
+            if (val < 0.25 || val > 100) {
+                console.log('💩 REJECTED: val out of range:', val);
+                alert('Base bet must be between $0.25 and $100');
+                return;
+            }
+
+            console.log('💩 SENDING to server:', {base_bet: val});
+            skipInputUpdate = true;
+
+            try {
+                const res = await fetch('/api/set_base_bet', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({base_bet: val})
                 });
-                fetchStatus();
+                const data = await res.json();
+                console.log('💩 SERVER RESPONSE:', data);
+
+                if (data.status === 'ok') {
+                    input.value = data.base_bet.toFixed(2);
+                    document.getElementById('base').textContent = '$' + data.base_bet.toFixed(2);
+                    console.log('💩 SUCCESS: base_bet set to', data.base_bet);
+                } else {
+                    console.log('💩 SERVER ERROR:', data);
+                    alert(data.message || 'Failed to set base bet');
+                }
+            } catch (err) {
+                console.log('💩 FETCH ERROR:', err);
             }
+
+            setTimeout(() => { skipInputUpdate = false; }, 1000);
+            fetchStatus();
+        }
+
+        async function toggleSlippage() {
+            const checked = document.getElementById('slippageCheck').checked;
+            console.log('💩 toggleSlippage:', checked);
+            await fetch('/api/set_slippage', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({use_slippage: checked})
+            });
+            fetchStatus();
         }
 
         fetchStatus();
@@ -705,6 +842,8 @@ def api_status():
             "entry_range": f"{config.stink.min_entry_price}-{config.stink.max_entry_price}¢" if config else "5-20¢",
             "min_entry": config.stink.min_entry_price if config else 5,
             "max_entry": config.stink.max_entry_price if config else 20,
+            "use_slippage": use_slippage,
+            "slippage_cents": SLIPPAGE_CENTS,
         },
         "ws": ws_status,
         "orderbooks": orderbooks[:50],
@@ -743,22 +882,45 @@ def api_stop():
 def api_set_base_bet():
     global trader, config
 
+    print(f"💩 ========== SET BASE BET REQUEST ==========")
     data = request.get_json()
+    print(f"💩 RAW REQUEST DATA: {data}")
+
     base_bet = data.get('base_bet', 1.0)
+    print(f"💩 PARSED base_bet: {base_bet} (type: {type(base_bet).__name__})")
 
     if base_bet < 0.25 or base_bet > 100:
+        print(f"💩 REJECTED: base_bet {base_bet} out of range 0.25-100")
         return jsonify({"status": "error", "message": "Base bet must be between $0.25 and $100"}), 400
 
     # Update config
+    old_config_val = config.stink.base_bet_dollars if config else None
     if config:
         config.stink.base_bet_dollars = base_bet
+        print(f"💩 CONFIG UPDATED: {old_config_val} -> {config.stink.base_bet_dollars}")
 
     # Update trader
+    old_trader_val = trader.stink.base_bet_dollars if trader else None
     if trader:
         trader.stink.base_bet_dollars = base_bet
+        print(f"💩 TRADER UPDATED: {old_trader_val} -> {trader.stink.base_bet_dollars}")
 
     log_activity(f"Base bet set to ${base_bet:.2f}")
+    print(f"💩 BASE BET SUCCESSFULLY SET TO: ${base_bet:.2f}")
+    print(f"💩 ==========================================")
     return jsonify({"status": "ok", "base_bet": base_bet})
+
+
+@app.route('/api/set_slippage', methods=['POST'])
+def api_set_slippage():
+    global use_slippage
+
+    data = request.get_json()
+    use_slippage = data.get('use_slippage', True)
+
+    print(f"💩 SLIPPAGE SET TO: {use_slippage} (+{SLIPPAGE_CENTS}¢ buffer)")
+    log_activity(f"Slippage {'ON' if use_slippage else 'OFF'} (+{SLIPPAGE_CENTS}¢)")
+    return jsonify({"status": "ok", "use_slippage": use_slippage})
 
 
 def main():

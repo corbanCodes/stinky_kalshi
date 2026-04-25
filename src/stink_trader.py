@@ -255,54 +255,89 @@ class StinkTrader:
 
         return opportunities
 
-    def execute_stink_bet(self, market: MarketData) -> Optional[TradeRecord]:
+    def execute_stink_bet(self, market: MarketData, actual_entry: int = None) -> Optional[TradeRecord]:
         """
         💩 Execute a stinky bet! 💩
 
         Buy NO contracts at the current ask price.
+        actual_entry: The actual market price (before slippage), used for cost calculation
         """
+        print(f"💩 ========== EXECUTE_STINK_BET CALLED ==========")
+        print(f"💩 INPUT market.ticker: {market.ticker}")
+        print(f"💩 INPUT market.no_ask (limit price): {market.no_ask}¢")
+        print(f"💩 INPUT actual_entry (market price): {actual_entry}¢")
+        print(f"💩 CURRENT _bet_tickers: {self._bet_tickers}")
+
         if market.ticker in self._bet_tickers:
+            print(f"💩 ABORT: Already bet on {market.ticker}")
             self.log(f"Already bet on {market.ticker}", "WARN")
             return None
 
         bet_amount = self.state.get_next_bet_amount(self.stink.base_bet_dollars)
-        entry_price = market.no_ask
+        limit_price = market.no_ask  # May include slippage buffer
+        # Use actual_entry for cost calculation if provided, otherwise use limit_price
+        cost_price = actual_entry if actual_entry else limit_price
 
-        # Calculate contracts: (bet_amount * 100) / entry_price
-        contracts = int((bet_amount * 100) / entry_price)
+        print(f"💩 CALC: base_bet=${self.stink.base_bet_dollars}, bet_number={self.state.bet_number}")
+        print(f"💩 CALC: bet_amount=${bet_amount:.2f}")
+        print(f"💩 CALC: limit_price={limit_price}¢ (for order)")
+        print(f"💩 CALC: cost_price={cost_price}¢ (for calculation)")
+
+        if not limit_price or limit_price <= 0:
+            print(f"💩 ABORT: Invalid limit_price: {limit_price}")
+            return None
+
+        # Calculate contracts based on expected fill price
+        contracts = int((bet_amount * 100) / cost_price)
         if contracts < 1:
             contracts = 1
 
-        # Actual cost
-        actual_cost = (contracts * entry_price) / 100
+        # Estimated cost (actual fill may be at cost_price or better)
+        actual_cost = (contracts * cost_price) / 100
+
+        print(f"💩 ORDER DETAILS:")
+        print(f"💩   Ticker: {market.ticker}")
+        print(f"💩   Side: NO (buy)")
+        print(f"💩   Limit Price: {limit_price}¢ (order will be placed at this)")
+        print(f"💩   Expected Fill: {cost_price}¢")
+        print(f"💩   Contracts: {contracts}")
+        print(f"💩   Est. Cost: ${actual_cost:.2f}")
+        print(f"💩   Bet #{self.state.bet_number} in round {self.state.round_number}")
+        print(f"💩   use_market_orders: {self.stink.use_market_orders}")
 
         self.log(f"💩 EXECUTING STINK BET 💩")
         self.log(f"    Ticker: {market.ticker}")
         self.log(f"    Side: NO")
-        self.log(f"    Entry: {entry_price}¢")
+        self.log(f"    Limit: {limit_price}¢ (expected fill: {cost_price}¢)")
         self.log(f"    Contracts: {contracts}")
-        self.log(f"    Cost: ${actual_cost:.2f}")
+        self.log(f"    Est. Cost: ${actual_cost:.2f}")
         self.log(f"    Bet #{self.state.bet_number} in round {self.state.round_number}")
 
         try:
-            # Place the order
+            print(f"💩 CALLING client.buy_no(ticker={market.ticker}, count={contracts}, price={limit_price})...")
+            # Place the order at limit_price (includes slippage buffer)
             order = self.client.buy_no(
                 ticker=market.ticker,
                 count=contracts,
-                price=entry_price if not self.stink.use_market_orders else None
+                price=limit_price if not self.stink.use_market_orders else None
             )
+
+            print(f"💩 ORDER RESPONSE:")
+            print(f"💩   order_id: {order.order_id}")
+            print(f"💩   status: {order.status}")
+            print(f"💩   filled_count: {order.filled_count}")
 
             self.log(f"    Order placed: {order.order_id}")
             self.log(f"    Status: {order.status}")
             self.log(f"    Filled: {order.filled_count}")
 
-            # Record the trade
+            # Record the trade (use cost_price as entry, that's what we expect to pay)
             record = TradeRecord(
                 timestamp=datetime.now(timezone.utc).isoformat(),
                 ticker=market.ticker,
                 side="no",
                 contracts=contracts,
-                entry_price=entry_price,
+                entry_price=cost_price,
                 bet_number=self.state.bet_number,
                 round_number=self.state.round_number,
                 bet_amount=actual_cost,
@@ -314,6 +349,7 @@ class StinkTrader:
 
             # Mark ticker as bet
             self._bet_tickers.add(market.ticker)
+            print(f"💩 ADDED {market.ticker} to _bet_tickers: {self._bet_tickers}")
 
             # Update state
             self.state.last_bet_time = record.timestamp
@@ -322,10 +358,16 @@ class StinkTrader:
 
             # Refresh balance
             self.refresh_balance()
+            print(f"💩 NEW BALANCE: ${self.balance:.2f}")
 
+            print(f"💩 ========== BET SUCCESSFUL ==========")
             return record
 
         except Exception as e:
+            import traceback
+            print(f"💩 ========== ORDER FAILED ==========")
+            print(f"💩 ERROR: {e}")
+            traceback.print_exc()
             self.log(f"Order failed: {e}", "ERROR")
             return None
 
