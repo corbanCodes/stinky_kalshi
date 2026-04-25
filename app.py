@@ -19,6 +19,7 @@ from src.config import load_config
 from src.stink_trader import StinkTrader
 from src.websocket_client import KalshiWebSocket, Orderbook
 from src.kalshi_client import KalshiClient, MarketData
+from src.recovery_trader import RecoveryTrader
 
 app = Flask(__name__)
 
@@ -38,6 +39,12 @@ is_trading = False
 is_ws_running = False
 use_slippage = True  # Default ON: add 3¢ buffer to limit orders
 SLIPPAGE_CENTS = 3
+
+# Recovery trading state
+recovery_trader = None
+recovery_thread = None
+is_recovery_trading = False
+recovery_mode = "conservative"  # "aggressive" or "conservative"
 
 # Activity log
 activity_log = []
@@ -350,6 +357,79 @@ def trading_loop():
     log_activity("Trading stopped")
 
 
+def recovery_trading_loop():
+    """Background trading loop for 2-stage recovery martingale."""
+    global is_recovery_trading, recovery_trader, ws_client, recovery_mode
+
+    log_activity(f"Recovery trading started! ({recovery_mode.upper()} mode)", "win")
+    loop_count = 0
+
+    while is_recovery_trading:
+        try:
+            loop_count += 1
+
+            # Log every 10 loops
+            if loop_count % 10 == 1:
+                print(f"[RECOVERY] Loop #{loop_count}: mode={recovery_mode}, stage={recovery_trader.state.current_stage}")
+                print(f"[RECOVERY] Balance=${recovery_trader.balance:.2f}, Round #{recovery_trader.state.round_number}")
+
+            # Check settlements first
+            recovery_trader.check_settlements()
+
+            # Use WebSocket orderbooks for opportunities
+            if not ws_client or not ws_client.is_connected:
+                if loop_count % 10 == 1:
+                    print(f"[RECOVERY] Waiting for WebSocket...")
+                time.sleep(1)
+                continue
+
+            # Get orderbooks dict
+            orderbooks = ws_client.orderbooks
+
+            if not orderbooks:
+                if loop_count % 10 == 1:
+                    print(f"[RECOVERY] No orderbooks available")
+                time.sleep(1)
+                continue
+
+            # Find recovery opportunity (80-87c, last 5 min)
+            opportunity = recovery_trader.find_opportunity_from_orderbook(orderbooks)
+
+            if not opportunity:
+                if loop_count % 30 == 1:  # Less frequent logging
+                    print(f"[RECOVERY] No opportunities in 80-87c range, 5min window")
+                time.sleep(1)
+                continue
+
+            # Found opportunity!
+            print(f"[RECOVERY] FOUND OPPORTUNITY: {opportunity['ticker']}")
+            print(f"[RECOVERY]   Side: {opportunity['side'].upper()}")
+            print(f"[RECOVERY]   Price: {opportunity['entry_price']}c")
+            print(f"[RECOVERY]   Time left: {opportunity['minutes_remaining']:.1f} min")
+            print(f"[RECOVERY]   BTC: ${opportunity['btc_price']:,.0f} {opportunity['btc_direction']} strike")
+
+            # Execute recovery bet
+            result = recovery_trader.execute_recovery_bet(opportunity, orderbooks)
+
+            if result:
+                stage_name = ["BASE", "STAGE 1", "STAGE 2"][result.stage]
+                log_activity(f"RECOVERY {stage_name}: {result.side.upper()} {result.ticker} @ {result.entry_price}c", "win")
+            else:
+                print(f"[RECOVERY] Bet execution failed")
+
+            time.sleep(2)  # Brief pause after trade
+
+        except Exception as e:
+            import traceback
+            print(f"[RECOVERY] ERROR: {e}")
+            traceback.print_exc()
+            log_activity(f"Recovery error: {e}", "loss")
+            time.sleep(5)
+
+    print(f"[RECOVERY] LOOP ENDED: is_recovery_trading={is_recovery_trading}")
+    log_activity("Recovery trading stopped")
+
+
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
@@ -526,8 +606,51 @@ HTML_TEMPLATE = """
                 <input type="checkbox" id="slippageCheck" onchange="toggleSlippage()" style="width:18px;height:18px;cursor:pointer;">
                 <label for="slippageCheck" style="color:#888;font-size:0.85em;cursor:pointer;">+3¢ slippage buffer</label>
             </div>
-            <button id="startBtn" class="btn btn-start" onclick="start()">▶️ START</button>
+            <button id="startBtn" class="btn btn-start" onclick="start()">▶️ START STINK</button>
             <button id="stopBtn" class="btn btn-stop" onclick="stop()" disabled>⏹️ STOP</button>
+        </div>
+
+        <!-- Recovery Trading Section -->
+        <div class="section" style="background: linear-gradient(135deg, #1e3a2a 0%, #1a2e2a 100%); border: 1px solid #00aa66;">
+            <h2 style="color: #00ff88;">🎰 2-Stage Recovery Martingale</h2>
+            <div style="display:flex;gap:15px;align-items:center;flex-wrap:wrap;margin-bottom:12px;">
+                <div style="display:flex;gap:8px;align-items:center;">
+                    <label style="color:#888;font-size:0.85em;">Mode:</label>
+                    <select id="recoveryMode" onchange="setRecoveryMode()" style="padding:8px 12px;border-radius:6px;border:1px solid #333;background:#1a1a2e;color:#00ff88;font-weight:bold;">
+                        <option value="conservative">Conservative (20% S2)</option>
+                        <option value="aggressive">Aggressive (50% S2)</option>
+                    </select>
+                </div>
+                <button id="startRecoveryBtn" class="btn btn-start" onclick="startRecovery()">▶️ START RECOVERY</button>
+                <button id="stopRecoveryBtn" class="btn btn-stop" onclick="stopRecovery()" disabled>⏹️ STOP</button>
+                <button class="btn" onclick="resetRecovery()" style="background:#666;color:#fff;padding:8px 12px;">Reset Stage</button>
+                <span id="recoveryStatus" class="badge badge-gray">Off</span>
+            </div>
+            <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:8px;">
+                <div class="card" style="background:#0a150f;">
+                    <h3 style="color:#00aa66;">Stage</h3>
+                    <div class="val" id="recoveryStage" style="color:#00ff88;">BASE</div>
+                </div>
+                <div class="card" style="background:#0a150f;">
+                    <h3 style="color:#00aa66;">Round</h3>
+                    <div class="val" id="recoveryRound" style="color:#00ff88;">#1</div>
+                </div>
+                <div class="card" style="background:#0a150f;">
+                    <h3 style="color:#00aa66;">To Recover</h3>
+                    <div class="val" id="recoveryLoss" style="color:#00ff88;">$0</div>
+                </div>
+                <div class="card" style="background:#0a150f;">
+                    <h3 style="color:#00aa66;">W/L</h3>
+                    <div class="val" id="recoveryWL" style="color:#00ff88;">0/0</div>
+                </div>
+                <div class="card" style="background:#0a150f;">
+                    <h3 style="color:#00aa66;">Profit</h3>
+                    <div class="val" id="recoveryProfit" style="color:#00ff88;">$0</div>
+                </div>
+            </div>
+            <div style="margin-top:8px;font-size:0.75em;color:#666;">
+                Entry: 80-87¢ | 5 min window | BTC direction | Stage 1+2 capped at 87¢ (90¢ w/ slippage)
+            </div>
         </div>
 
         <div class="grid">
@@ -776,8 +899,77 @@ HTML_TEMPLATE = """
             fetchStatus();
         }
 
+        // Recovery Trading Functions
+        async function startRecovery() {
+            await fetch('/api/recovery/start', {method:'POST'});
+            fetchRecoveryStatus();
+        }
+
+        async function stopRecovery() {
+            await fetch('/api/recovery/stop', {method:'POST'});
+            fetchRecoveryStatus();
+        }
+
+        async function setRecoveryMode() {
+            const mode = document.getElementById('recoveryMode').value;
+            await fetch('/api/recovery/set_mode', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({mode: mode})
+            });
+            fetchRecoveryStatus();
+        }
+
+        async function resetRecovery() {
+            if (confirm('Reset recovery stage to BASE? This will clear any loss tracking.')) {
+                await fetch('/api/recovery/reset', {method:'POST'});
+                fetchRecoveryStatus();
+            }
+        }
+
+        async function fetchRecoveryStatus() {
+            try {
+                const r = await fetch('/api/recovery/status');
+                const d = await r.json();
+                updateRecovery(d);
+            } catch(e) { console.error('Recovery status error:', e); }
+        }
+
+        function updateRecovery(d) {
+            const stages = ['BASE', 'STAGE 1', 'STAGE 2'];
+            document.getElementById('recoveryStage').textContent = stages[d.current_stage] || 'BASE';
+            document.getElementById('recoveryRound').textContent = '#' + (d.round_number || 1);
+            document.getElementById('recoveryLoss').textContent = '$' + ((d.total_loss_cents || 0) / 100).toFixed(2);
+            document.getElementById('recoveryWL').textContent = (d.total_wins || 0) + '/' + (d.total_losses || 0);
+
+            const profitEl = document.getElementById('recoveryProfit');
+            profitEl.textContent = '$' + (d.total_profit || 0).toFixed(2);
+            profitEl.style.color = (d.total_profit || 0) >= 0 ? '#00ff88' : '#ff4444';
+
+            const statusEl = document.getElementById('recoveryStatus');
+            const startBtn = document.getElementById('startRecoveryBtn');
+            const stopBtn = document.getElementById('stopRecoveryBtn');
+
+            if (d.is_trading) {
+                statusEl.textContent = d.mode.toUpperCase() + ' ACTIVE';
+                statusEl.className = 'badge badge-yellow pulse';
+                startBtn.disabled = true;
+                stopBtn.disabled = false;
+            } else {
+                statusEl.textContent = 'Off';
+                statusEl.className = 'badge badge-gray';
+                startBtn.disabled = false;
+                stopBtn.disabled = true;
+            }
+
+            // Sync mode dropdown
+            document.getElementById('recoveryMode').value = d.mode || 'conservative';
+        }
+
         fetchStatus();
+        fetchRecoveryStatus();
         setInterval(fetchStatus, 500);
+        setInterval(fetchRecoveryStatus, 1000);
     </script>
 </body>
 </html>
@@ -953,8 +1145,101 @@ def api_set_slippage():
     return jsonify({"status": "ok", "use_slippage": use_slippage})
 
 
+# ========== RECOVERY TRADING API ==========
+
+@app.route('/api/recovery/start', methods=['POST'])
+def api_start_recovery():
+    global recovery_trader, recovery_thread, is_recovery_trading, recovery_mode, config
+
+    if is_recovery_trading:
+        return jsonify({"status": "already running"})
+
+    try:
+        # Initialize recovery trader if needed
+        if recovery_trader is None:
+            recovery_trader = RecoveryTrader(config)
+
+        recovery_trader.set_mode(recovery_mode)
+
+        is_recovery_trading = True
+        recovery_thread = threading.Thread(target=recovery_trading_loop, daemon=True)
+        recovery_thread.start()
+        return jsonify({"status": "started", "mode": recovery_mode})
+    except Exception as e:
+        log_activity(f"Failed to start recovery: {e}", "loss")
+        is_recovery_trading = False
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route('/api/recovery/stop', methods=['POST'])
+def api_stop_recovery():
+    global is_recovery_trading
+    is_recovery_trading = False
+    log_activity("Recovery stop requested...")
+    return jsonify({"status": "stopping"})
+
+
+@app.route('/api/recovery/set_mode', methods=['POST'])
+def api_set_recovery_mode():
+    global recovery_mode, recovery_trader
+
+    data = request.get_json()
+    mode = data.get('mode', 'conservative')
+
+    if mode not in ('aggressive', 'conservative'):
+        return jsonify({"status": "error", "message": "Mode must be 'aggressive' or 'conservative'"}), 400
+
+    recovery_mode = mode
+    if recovery_trader:
+        recovery_trader.set_mode(mode)
+
+    pct = "50%" if mode == "aggressive" else "20%"
+    log_activity(f"Recovery mode: {mode.upper()} (Stage 2 = {pct})")
+    return jsonify({"status": "ok", "mode": mode})
+
+
+@app.route('/api/recovery/status', methods=['GET'])
+def api_recovery_status():
+    global recovery_trader, is_recovery_trading, recovery_mode
+
+    if recovery_trader is None:
+        return jsonify({
+            "is_trading": False,
+            "mode": recovery_mode,
+            "status": "not initialized"
+        })
+
+    status = recovery_trader.get_status()
+    return jsonify({
+        "is_trading": is_recovery_trading,
+        "mode": recovery_mode,
+        "balance": status["balance"],
+        "current_stage": status["current_stage"],
+        "round_number": status["round_number"],
+        "total_loss_cents": status["total_loss_cents"],
+        "total_wins": status["total_wins"],
+        "total_losses": status["total_losses"],
+        "total_profit": status["total_profit"],
+        "sizing": status["sizing"],
+        "recent_trades": status["recent_trades"][-5:],
+    })
+
+
+@app.route('/api/recovery/reset', methods=['POST'])
+def api_reset_recovery():
+    global recovery_trader
+
+    if recovery_trader:
+        recovery_trader.state.reset_to_base()
+        recovery_trader.state.save(recovery_trader.state_path)
+        log_activity("Recovery state reset to BASE")
+        return jsonify({"status": "ok", "stage": 0})
+
+    return jsonify({"status": "error", "message": "Recovery trader not initialized"}), 400
+
+
 def main():
-    global trader, ws_client, rest_client, config, ws_thread
+    global trader, ws_client, rest_client, config, ws_thread, recovery_trader
 
     print("💩" * 40)
     print("💩 STINKY KALSHI - LIVE ORDERBOOK 💩")
@@ -965,9 +1250,15 @@ def main():
 
     try:
         trader = StinkTrader(config)
-        log_activity(f"Trader ready. Balance: ${trader.balance:.2f}")
+        log_activity(f"Stink Trader ready. Balance: ${trader.balance:.2f}")
     except Exception as e:
-        log_activity(f"Trader init failed: {e}", "loss")
+        log_activity(f"Stink Trader init failed: {e}", "loss")
+
+    try:
+        recovery_trader = RecoveryTrader(config)
+        log_activity(f"Recovery Trader ready. Balance: ${recovery_trader.balance:.2f}")
+    except Exception as e:
+        log_activity(f"Recovery Trader init failed: {e}", "loss")
 
     ws_client = KalshiWebSocket(
         config.kalshi,
