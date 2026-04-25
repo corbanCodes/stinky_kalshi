@@ -270,12 +270,27 @@ class KalshiClient:
             raise
 
     def buy_no(self, ticker: str, count: int, price: int = None) -> OrderResponse:
-        """💩 Buy NO contracts (our stinky longshot bet) 💩"""
+        """💩 Buy NO contracts (stinky longshot bet) 💩"""
         order_type = "limit" if price else "market"
         print(f"💩 ========== BUY_NO CALLED ==========")
         print(f"💩 ticker={ticker}, count={count}, price={price}")
         print(f"💩 order_type determined: {order_type}")
         return self.place_order(ticker, "no", "buy", count, price, order_type)
+
+    def buy_yes(self, ticker: str, count: int, price: int = None) -> OrderResponse:
+        """💩 Buy YES contracts (stinky longshot bet) 💩"""
+        order_type = "limit" if price else "market"
+        print(f"💩 ========== BUY_YES CALLED ==========")
+        print(f"💩 ticker={ticker}, count={count}, price={price}")
+        print(f"💩 order_type determined: {order_type}")
+        return self.place_order(ticker, "yes", "buy", count, price, order_type)
+
+    def buy_stinky(self, ticker: str, side: str, count: int, price: int = None) -> OrderResponse:
+        """💩 Buy the stinky side (YES or NO) 💩"""
+        if side == "yes":
+            return self.buy_yes(ticker, count, price)
+        else:
+            return self.buy_no(ticker, count, price)
 
     def get_orders(self, status: str = None, ticker: str = None) -> list[OrderResponse]:
         """Get list of orders."""
@@ -342,6 +357,50 @@ class KalshiClient:
         """Get fill history."""
         data = self._request("GET", "/portfolio/fills", params={"limit": limit})
         return data.get("fills", [])
+
+    def get_settlements(self, limit: int = 100) -> list[dict]:
+        """Get settlement history."""
+        data = self._request("GET", "/portfolio/settlements", params={"limit": limit})
+        return data.get("settlements", [])
+
+    def check_market_settlement(self, ticker: str) -> tuple[bool, str]:
+        """
+        Check if a market has settled and what the result was.
+
+        Returns:
+            (is_settled, result) where result is "yes" or "no" or "" if not settled
+        """
+        try:
+            market = self.get_market(ticker)
+            print(f"💩 CHECK_SETTLEMENT: {ticker} status={market.status}")
+
+            if market.status == "settled":
+                # Get settlements to find the result
+                settlements = self.get_settlements(limit=50)
+                for s in settlements:
+                    if s.get("ticker") == ticker or s.get("market_ticker") == ticker:
+                        result = s.get("result", s.get("settlement_result", ""))
+                        print(f"💩 SETTLEMENT FOUND: {ticker} result={result}")
+                        return True, result
+
+                # Market is settled but we don't have the result from settlements endpoint
+                # Check positions endpoint as fallback - if we have no position, we likely lost
+                positions = self.get_positions()
+                for pos in positions:
+                    if pos.get("ticker") == ticker:
+                        # We still have a position - it's being processed
+                        print(f"💩 SETTLEMENT: Still has position, waiting...")
+                        return False, ""
+
+                # No position found - market settled
+                print(f"💩 SETTLEMENT: Market settled but no result found in settlements")
+                return True, ""
+
+            return False, ""
+
+        except Exception as e:
+            print(f"💩 ERROR checking settlement for {ticker}: {e}")
+            return False, ""
 
     # ========== Orderbook ==========
 

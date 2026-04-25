@@ -255,28 +255,41 @@ class StinkTrader:
 
         return opportunities
 
-    def execute_stink_bet(self, market: MarketData, actual_entry: int = None) -> Optional[TradeRecord]:
+    def execute_stink_bet(self, ticker: str = None, side: str = None, price: int = None, limit_price: int = None, market: MarketData = None, actual_entry: int = None) -> Optional[TradeRecord]:
         """
         💩 Execute a stinky bet! 💩
 
-        Buy NO contracts at the current ask price.
-        actual_entry: The actual market price (before slippage), used for cost calculation
+        Buy YES or NO contracts at the cheap price.
+
+        Args:
+            ticker: Market ticker
+            side: "yes" or "no" - whichever is the longshot
+            price: Actual market price (for cost calculation)
+            limit_price: Price to place order at (includes slippage)
+            market: (deprecated) MarketData object for backwards compatibility
+            actual_entry: (deprecated) Use 'price' instead
         """
+        # Handle backwards compatibility with old MarketData-based calls
+        if market is not None:
+            ticker = market.ticker
+            side = "no"  # Old code always bet NO
+            limit_price = market.no_ask
+            price = actual_entry if actual_entry else limit_price
+
         print(f"💩 ========== EXECUTE_STINK_BET CALLED ==========")
-        print(f"💩 INPUT market.ticker: {market.ticker}")
-        print(f"💩 INPUT market.no_ask (limit price): {market.no_ask}¢")
-        print(f"💩 INPUT actual_entry (market price): {actual_entry}¢")
+        print(f"💩 INPUT ticker: {ticker}")
+        print(f"💩 INPUT side: {side}")
+        print(f"💩 INPUT price (market): {price}¢")
+        print(f"💩 INPUT limit_price (with slippage): {limit_price}¢")
         print(f"💩 CURRENT _bet_tickers: {self._bet_tickers}")
 
-        if market.ticker in self._bet_tickers:
-            print(f"💩 ABORT: Already bet on {market.ticker}")
-            self.log(f"Already bet on {market.ticker}", "WARN")
+        if ticker in self._bet_tickers:
+            print(f"💩 ABORT: Already bet on {ticker}")
+            self.log(f"Already bet on {ticker}", "WARN")
             return None
 
         bet_amount = self.state.get_next_bet_amount(self.stink.base_bet_dollars)
-        limit_price = market.no_ask  # May include slippage buffer
-        # Use actual_entry for cost calculation if provided, otherwise use limit_price
-        cost_price = actual_entry if actual_entry else limit_price
+        cost_price = price if price else limit_price
 
         print(f"💩 CALC: base_bet=${self.stink.base_bet_dollars}, bet_number={self.state.bet_number}")
         print(f"💩 CALC: bet_amount=${bet_amount:.2f}")
@@ -296,8 +309,8 @@ class StinkTrader:
         actual_cost = (contracts * cost_price) / 100
 
         print(f"💩 ORDER DETAILS:")
-        print(f"💩   Ticker: {market.ticker}")
-        print(f"💩   Side: NO (buy)")
+        print(f"💩   Ticker: {ticker}")
+        print(f"💩   Side: {side.upper()} (buy)")
         print(f"💩   Limit Price: {limit_price}¢ (order will be placed at this)")
         print(f"💩   Expected Fill: {cost_price}¢")
         print(f"💩   Contracts: {contracts}")
@@ -306,8 +319,8 @@ class StinkTrader:
         print(f"💩   use_market_orders: {self.stink.use_market_orders}")
 
         self.log(f"💩 EXECUTING STINK BET 💩")
-        self.log(f"    Ticker: {market.ticker}")
-        self.log(f"    Side: NO")
+        self.log(f"    Ticker: {ticker}")
+        self.log(f"    Side: {side.upper()}")
         self.log(f"    Limit: {limit_price}¢ (expected fill: {cost_price}¢)")
         self.log(f"    Contracts: {contracts}")
         self.log(f"    Est. Cost: ${actual_cost:.2f}")
@@ -316,12 +329,13 @@ class StinkTrader:
         try:
             # Determine price to send
             order_price = limit_price if not self.stink.use_market_orders else None
-            print(f"💩 CALLING client.buy_no(ticker={market.ticker}, count={contracts}, price={order_price})...")
+            print(f"💩 CALLING client.buy_stinky(ticker={ticker}, side={side}, count={contracts}, price={order_price})...")
             print(f"💩 NOTE: use_market_orders={self.stink.use_market_orders}")
 
-            # Place the order
-            order = self.client.buy_no(
-                ticker=market.ticker,
+            # Place the order on the correct side
+            order = self.client.buy_stinky(
+                ticker=ticker,
+                side=side,
                 count=contracts,
                 price=order_price
             )
@@ -354,8 +368,8 @@ class StinkTrader:
             # Record the trade (use cost_price as entry, that's what we expect to pay)
             record = TradeRecord(
                 timestamp=datetime.now(timezone.utc).isoformat(),
-                ticker=market.ticker,
-                side="no",
+                ticker=ticker,
+                side=side,
                 contracts=contracts,
                 entry_price=cost_price,
                 bet_number=self.state.bet_number,
@@ -368,12 +382,12 @@ class StinkTrader:
             self._save_history()
 
             # Mark ticker as bet
-            self._bet_tickers.add(market.ticker)
-            print(f"💩 ADDED {market.ticker} to _bet_tickers: {self._bet_tickers}")
+            self._bet_tickers.add(ticker)
+            print(f"💩 ADDED {ticker} to _bet_tickers: {self._bet_tickers}")
 
             # Update state
             self.state.last_bet_time = record.timestamp
-            self.state.last_ticker = market.ticker
+            self.state.last_ticker = ticker
             self.state.save(self.state_path)
 
             # Refresh balance
@@ -394,43 +408,90 @@ class StinkTrader:
     def check_settlements(self):
         """
         💩 Check for settled positions and update state 💩
+
+        Uses the proper settlement tracking approach:
+        1. Check market status for markets we have pending trades on
+        2. Get settlement result from /portfolio/settlements
+        3. Compare our side to settlement result to determine win/loss
         """
-        try:
-            # Get recent fills/settlements
-            fills = self.client.get_fills(limit=50)
+        print(f"💩 CHECK_SETTLEMENTS: Checking {len(self.trade_history)} trades in history")
+        print(f"💩 CHECK_SETTLEMENTS: _bet_tickers = {self._bet_tickers}")
 
-            for fill in fills:
-                ticker = fill.get("ticker", "")
+        # Get all pending trades
+        pending_trades = [t for t in self.trade_history if t.result == "pending"]
+        print(f"💩 CHECK_SETTLEMENTS: Found {len(pending_trades)} pending trades")
 
-                # Find matching pending trade
-                for trade in self.trade_history:
-                    if trade.ticker == ticker and trade.result == "pending":
-                        # Check if this is a settlement (is_taker with no order = settlement)
-                        if fill.get("is_taker") is False and fill.get("action") == "sell":
-                            # This is likely a settlement
-                            # For NO side: if we got paid, we won
-                            credits = fill.get("credits_cents", 0) / 100
+        if not pending_trades:
+            return
 
-                            if credits > 0:
-                                # WIN!
-                                trade.result = "win"
-                                trade.payout = credits
-                                trade.profit = credits - trade.bet_amount
-                                self.state.on_win(trade.profit, self.stink.base_bet_dollars)
-                            else:
-                                # LOSS
-                                trade.result = "loss"
-                                trade.profit = -trade.bet_amount
-                                self.state.on_loss(trade.bet_amount)
+        for trade in pending_trades:
+            ticker = trade.ticker
+            print(f"💩 CHECKING: {ticker} (side={trade.side}, bet #{trade.bet_number})")
 
-                            self._save_history()
-                            self.state.save(self.state_path)
+            try:
+                # Check if market has settled
+                is_settled, result = self.client.check_market_settlement(ticker)
 
-                            # Remove from bet tickers so we can bet on next window
-                            self._bet_tickers.discard(ticker)
+                if is_settled:
+                    print(f"💩 SETTLED! {ticker} result={result}, our side={trade.side}")
 
-        except Exception as e:
-            self.log(f"Error checking settlements: {e}", "ERROR")
+                    if result:
+                        # We have the settlement result - compare to our side
+                        won = (trade.side == result)
+                    else:
+                        # No result from API - use fallback: check if we got paid
+                        # Get recent settlements and check for payout
+                        settlements = self.client.get_settlements(limit=50)
+                        payout_found = False
+                        for s in settlements:
+                            if s.get("ticker") == ticker or s.get("market_ticker") == ticker:
+                                revenue = s.get("revenue", 0)
+                                if revenue > 0:
+                                    won = True
+                                    payout_found = True
+                                else:
+                                    won = False
+                                    payout_found = True
+                                break
+
+                        if not payout_found:
+                            # Can't determine - assume loss (safer for bet progression)
+                            print(f"💩 No settlement data found - assuming loss")
+                            won = False
+
+                    # Update trade and state
+                    if won:
+                        # WIN!
+                        payout = trade.contracts  # $1 per contract
+                        profit = payout - trade.bet_amount
+                        trade.result = "win"
+                        trade.payout = payout
+                        trade.profit = profit
+                        self.state.on_win(profit, self.stink.base_bet_dollars)
+                        print(f"💩💩💩 WIN! Profit: ${profit:.2f}")
+                    else:
+                        # LOSS
+                        trade.result = "loss"
+                        trade.profit = -trade.bet_amount
+                        self.state.on_loss(trade.bet_amount)
+                        print(f"💩 LOSS! Lost: ${trade.bet_amount:.2f}")
+                        print(f"💩 New bet_number: {self.state.bet_number}")
+
+                    # Save state
+                    self._save_history()
+                    self.state.save(self.state_path)
+
+                    # Remove from bet tickers so we can bet on next window
+                    self._bet_tickers.discard(ticker)
+                    print(f"💩 Removed {ticker} from _bet_tickers: {self._bet_tickers}")
+
+                    # Refresh balance
+                    self.refresh_balance()
+
+            except Exception as e:
+                import traceback
+                print(f"💩 ERROR checking settlement for {ticker}: {e}")
+                traceback.print_exc()
 
     def get_status(self) -> dict:
         """Get current trader status."""

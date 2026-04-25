@@ -292,10 +292,15 @@ def trading_loop():
                 is_trading = False
                 break
 
-            # Sort and get best
-            opportunities.sort(key=lambda ob: ob.no_ask or 999)
+            # Sort by stinky price (whichever side is cheap) and get best
+            opportunities.sort(key=lambda ob: ob.get_stinky_price(trader.stink.min_entry_price, trader.stink.max_entry_price) or 999)
             best = opportunities[0]
-            print(f"💩 BEST OPPORTUNITY: {best.ticker} @ {best.no_ask}¢")
+
+            # Determine which side is stinky (YES or NO)
+            stinky_side = best.get_stinky_side(trader.stink.min_entry_price, trader.stink.max_entry_price)
+            stinky_price = best.get_stinky_price(trader.stink.min_entry_price, trader.stink.max_entry_price)
+
+            print(f"💩 BEST OPPORTUNITY: {best.ticker} {stinky_side.upper()} @ {stinky_price}¢")
 
             # Check if already bet on this ticker
             if best.ticker in trader._bet_tickers:
@@ -305,34 +310,29 @@ def trading_loop():
 
             # EXECUTE THE BET!
             # Apply slippage buffer if enabled
-            actual_no_ask = best.no_ask or 0
-            limit_price = actual_no_ask + SLIPPAGE_CENTS if use_slippage else actual_no_ask
+            actual_price = stinky_price or 0
+            limit_price = actual_price + SLIPPAGE_CENTS if use_slippage else actual_price
 
             print(f"💩 ========== EXECUTING BET ==========")
             print(f"💩 TICKER: {best.ticker}")
-            print(f"💩 NO_ASK: {actual_no_ask}¢")
+            print(f"💩 SIDE: {stinky_side.upper()}")
+            print(f"💩 PRICE: {actual_price}¢")
             print(f"💩 SLIPPAGE: {'ON +' + str(SLIPPAGE_CENTS) + '¢' if use_slippage else 'OFF'}")
             print(f"💩 LIMIT_PRICE: {limit_price}¢")
             print(f"💩 BET_AMOUNT: ${next_bet:.2f}")
-            print(f"💩 CONTRACTS: {int((next_bet * 100) / actual_no_ask) if actual_no_ask else 0}")
+            print(f"💩 CONTRACTS: {int((next_bet * 100) / actual_price) if actual_price else 0}")
 
-            market = MarketData(
+            result = trader.execute_stink_bet(
                 ticker=best.ticker,
-                yes_bid=best.best_yes_bid or 0,
-                yes_ask=best.yes_ask or 0,
-                no_bid=best.best_no_bid or 0,
-                no_ask=limit_price,  # Use limit price with slippage
-                volume=0,
-                status="open",
-                close_time="",
+                side=stinky_side,
+                price=actual_price,
+                limit_price=limit_price,
             )
-
-            result = trader.execute_stink_bet(market, actual_entry=actual_no_ask)
 
             if result:
                 print(f"💩 ========== BET PLACED ==========")
                 print(f"💩 RESULT: {result}")
-                log_activity(f"BET: {result.ticker} @ {result.entry_price}¢ (${result.bet_amount:.2f})", "win")
+                log_activity(f"BET: {result.side.upper()} {result.ticker} @ {result.entry_price}¢ (${result.bet_amount:.2f})", "win")
             else:
                 print(f"💩 ========== BET FAILED ==========")
                 print(f"💩 execute_stink_bet returned None")
@@ -479,8 +479,10 @@ HTML_TEMPLATE = """
         .ob-item .tk { font-weight: bold; font-size: 0.85em; }
         .ob-item .age { color: #555; font-size: 0.7em; }
         .ob-item .prices { display: flex; gap: 6px; font-size: 0.8em; }
-        .ob-item .no { background: #00ff88; color: #000; padding: 2px 8px; border-radius: 10px; font-weight: bold; }
-        .ob-item .yes { background: #ff4444; color: #fff; padding: 2px 8px; border-radius: 10px; }
+        .ob-item .yes { background: #00ff88; color: #000; padding: 2px 8px; border-radius: 10px; font-weight: bold; }
+        .ob-item .no { background: #ff4444; color: #fff; padding: 2px 8px; border-radius: 10px; }
+        .ob-item .yes.target { box-shadow: 0 0 8px #00ff88; animation: pulse 1s infinite; }
+        .ob-item .no.target { box-shadow: 0 0 8px #ff4444; animation: pulse 1s infinite; }
         .ob-item .qty { color: #666; font-size: 0.7em; }
 
         .log {
@@ -503,7 +505,7 @@ HTML_TEMPLATE = """
     <div class="container">
         <div class="header">
             <h1>💩 Stinky Kalshi</h1>
-            <div class="sub">Live WebSocket Orderbook • NO @ 10-15¢</div>
+            <div class="sub">Live WebSocket Orderbook • Longshot Betting</div>
         </div>
 
         <div class="status-row">
@@ -663,15 +665,17 @@ HTML_TEMPLATE = """
             const obEl = document.getElementById('orderbooks');
             if (d.orderbooks && d.orderbooks.length > 0) {
                 obEl.innerHTML = d.orderbooks.map(ob => {
-                    const stinky = ob.no_ask && ob.no_ask >= d.config.min_entry && ob.no_ask <= d.config.max_entry;
+                    const stinky = ob.stinky_side !== null;
                     const age = ((Date.now()/1000) - ob.last_update).toFixed(1);
                     const short = ob.ticker.split('-').pop();
+                    const yesStinky = ob.stinky_side === 'yes';
+                    const noStinky = ob.stinky_side === 'no';
                     return `<div class="ob-item ${stinky?'stinky':''}">
                         <div><div class="tk">${short}</div><div class="age">${age}s • ${ob.update_count}x</div></div>
                         <div class="prices">
-                            ${ob.no_ask ? `<span class="no">NO ${ob.no_ask}¢</span>` : ''}
-                            ${ob.yes_ask ? `<span class="yes">YES ${ob.yes_ask}¢</span>` : ''}
-                            ${ob.no_ask_quantity ? `<span class="qty">${ob.no_ask_quantity}</span>` : ''}
+                            ${ob.yes_ask ? `<span class="yes ${yesStinky?'target':''}">YES ${ob.yes_ask}¢</span>` : ''}
+                            ${ob.no_ask ? `<span class="no ${noStinky?'target':''}">NO ${ob.no_ask}¢</span>` : ''}
+                            ${ob.stinky_side ? `<span class="qty">🎯</span>` : ''}
                         </div>
                     </div>`;
                 }).join('');
@@ -831,13 +835,21 @@ def api_status():
         ws_status = ws_client.get_status()
         for ob in ws_client.orderbooks.values():
             ob_dict = ob.to_dict()
+            # Add stinky side info
+            if config:
+                ob_dict['stinky_side'] = ob.get_stinky_side(config.stink.min_entry_price, config.stink.max_entry_price)
+                ob_dict['stinky_price'] = ob.get_stinky_price(config.stink.min_entry_price, config.stink.max_entry_price)
+            else:
+                ob_dict['stinky_side'] = None
+                ob_dict['stinky_price'] = None
             orderbooks.append(ob_dict)
             if config and ob.is_stinky(config.stink.min_entry_price, config.stink.max_entry_price):
                 stinky_count += 1
 
+        # Sort by stinky price (cheapest first), non-stinky last
         orderbooks.sort(key=lambda x: (
-            not (x['no_ask'] and config and config.stink.min_entry_price <= x['no_ask'] <= config.stink.max_entry_price),
-            x['no_ask'] or 999
+            x['stinky_side'] is None,  # Non-stinky goes last
+            x['stinky_price'] or 999
         ))
 
     balance = 0

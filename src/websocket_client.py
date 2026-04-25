@@ -90,9 +90,37 @@ class Orderbook:
         return sum(l.quantity for l in self.yes_bids if l.price == best_price)
 
     def is_stinky(self, min_price: int = 5, max_price: int = 20) -> bool:
-        """💩 Is this a stinky opportunity? NO ask in target range."""
-        ask = self.no_ask
-        return ask is not None and min_price <= ask <= max_price
+        """💩 Is this a stinky opportunity? YES or NO ask in target range."""
+        yes = self.yes_ask
+        no = self.no_ask
+        yes_stinky = yes is not None and min_price <= yes <= max_price
+        no_stinky = no is not None and min_price <= no <= max_price
+        return yes_stinky or no_stinky
+
+    def get_stinky_side(self, min_price: int = 5, max_price: int = 20) -> Optional[str]:
+        """💩 Which side is stinky? Returns 'yes', 'no', or None."""
+        yes = self.yes_ask
+        no = self.no_ask
+        yes_stinky = yes is not None and min_price <= yes <= max_price
+        no_stinky = no is not None and min_price <= no <= max_price
+
+        if yes_stinky and no_stinky:
+            # Both are stinky - pick the cheaper one
+            return "yes" if yes < no else "no"
+        elif yes_stinky:
+            return "yes"
+        elif no_stinky:
+            return "no"
+        return None
+
+    def get_stinky_price(self, min_price: int = 5, max_price: int = 20) -> Optional[int]:
+        """💩 Get the stinky price (the cheap side's ask)."""
+        side = self.get_stinky_side(min_price, max_price)
+        if side == "yes":
+            return self.yes_ask
+        elif side == "no":
+            return self.no_ask
+        return None
 
     def to_dict(self) -> dict:
         """Convert to JSON-serializable dict."""
