@@ -68,13 +68,41 @@ def on_connection_change(connected: bool, message: str):
         log_activity(f"WebSocket: {message}", "loss")
 
 
+# Daily balance logging
+last_balance_log_date = None
+
+def check_daily_balance_log():
+    """Log balance at midnight each day."""
+    global last_balance_log_date, trader
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    current_hour = datetime.now().hour
+
+    # Log at midnight (hour 0) if we haven't logged today
+    if current_hour == 0 and last_balance_log_date != today and trader:
+        try:
+            trader.refresh_balance()
+            log_activity(f"📊 DAILY BALANCE ({today}): ${trader.balance:.2f}", "win")
+            last_balance_log_date = today
+        except Exception as e:
+            log_activity(f"Failed to log daily balance: {e}", "loss")
+
+
 async def refresh_market_subscriptions():
     """Fetch current BTC 15-min markets and subscribe to their orderbooks."""
     global rest_client, ws_client
 
     try:
+        log_activity("Fetching BTC 15-min markets...")
         markets = rest_client.get_btc_15min_markets()
+        log_activity(f"Found {len(markets)} total markets")
+
         active_tickers = {m.ticker for m in markets if m.status == "open"}
+        log_activity(f"Found {len(active_tickers)} open markets")
+
+        if not active_tickers:
+            log_activity("No open BTC 15-min markets found", "loss")
+            return
 
         # Unsubscribe from closed markets
         for ticker in list(ws_client.subscribed_tickers):
@@ -86,15 +114,20 @@ async def refresh_market_subscriptions():
         new_count = 0
         for ticker in active_tickers:
             if ticker not in ws_client.subscribed_tickers:
-                await ws_client.subscribe(ticker)
-                new_count += 1
-                await asyncio.sleep(0.05)
+                log_activity(f"Subscribing to {ticker}...")
+                success = await ws_client.subscribe(ticker)
+                if success:
+                    new_count += 1
+                else:
+                    log_activity(f"Failed to subscribe to {ticker}", "loss")
+                await asyncio.sleep(0.1)
 
-        if new_count > 0:
-            log_activity(f"Subscribed to {new_count} new markets (total: {len(ws_client.subscribed_tickers)})")
+        log_activity(f"Subscribed to {new_count} new markets (total: {len(ws_client.subscribed_tickers)})", "win" if new_count > 0 else "")
 
     except Exception as e:
+        import traceback
         log_activity(f"Market refresh error: {e}", "loss")
+        log_activity(f"Traceback: {traceback.format_exc()}", "loss")
 
 
 async def ws_main_loop():
@@ -112,11 +145,17 @@ async def ws_main_loop():
         try:
             # Connect if needed
             if not ws_client._connected:
+                log_activity("Attempting WebSocket connection...")
                 if not await ws_client.connect():
+                    log_activity(f"Connection failed, retrying in {reconnect_delay}s", "loss")
                     await asyncio.sleep(reconnect_delay)
                     reconnect_delay = min(reconnect_delay * 2, 30)
                     continue
                 reconnect_delay = 1
+                # Immediately subscribe to markets after connecting
+                log_activity("Connected! Subscribing to markets...")
+                await refresh_market_subscriptions()
+                last_refresh = time.time()
 
             # Refresh market subscriptions periodically
             if time.time() - last_refresh > refresh_interval:
@@ -130,9 +169,12 @@ async def ws_main_loop():
                     await ws_client._handle_message(message)
                 except asyncio.TimeoutError:
                     pass
+                except Exception as recv_err:
+                    log_activity(f"Recv error: {recv_err}", "loss")
+                    raise
 
         except Exception as e:
-            log_activity(f"WebSocket error: {e}", "loss")
+            log_activity(f"WebSocket loop error: {e}", "loss")
             ws_client._connected = False
             await asyncio.sleep(reconnect_delay)
 
@@ -360,6 +402,12 @@ HTML_TEMPLATE = """
         </div>
 
         <div class="controls">
+            <div style="display:flex;align-items:center;gap:8px;">
+                <label style="color:#888;font-size:0.85em;">Base Bet: $</label>
+                <input type="number" id="baseBetInput" value="1.00" step="0.25" min="0.25" max="100"
+                    style="width:70px;padding:8px;border-radius:6px;border:1px solid #333;background:#1a1a2e;color:#00ff88;font-size:1em;font-weight:bold;">
+                <button class="btn" onclick="setBaseBet()" style="background:#666;padding:8px 15px;">Set</button>
+            </div>
             <button id="startBtn" class="btn btn-start" onclick="start()">▶️ START</button>
             <button id="stopBtn" class="btn btn-stop" onclick="stop()" disabled>⏹️ STOP</button>
         </div>
@@ -462,6 +510,11 @@ HTML_TEMPLATE = """
             document.getElementById('bets').textContent = d.state.total_bets;
             document.getElementById('base').textContent = '$' + d.config.base_bet.toFixed(2);
             document.getElementById('range').textContent = d.config.entry_range;
+            // Update input field if not focused
+            const input = document.getElementById('baseBetInput');
+            if (document.activeElement !== input) {
+                input.value = d.config.base_bet.toFixed(2);
+            }
 
             // WS stats
             document.getElementById('subCnt').textContent = d.ws.subscribed_count + ' mkts';
@@ -509,6 +562,17 @@ HTML_TEMPLATE = """
 
         async function start() { await fetch('/api/start', {method:'POST'}); fetchStatus(); }
         async function stop() { await fetch('/api/stop', {method:'POST'}); fetchStatus(); }
+        async function setBaseBet() {
+            const val = parseFloat(document.getElementById('baseBetInput').value);
+            if (val >= 0.25 && val <= 100) {
+                await fetch('/api/set_base_bet', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({base_bet: val})
+                });
+                fetchStatus();
+            }
+        }
 
         fetchStatus();
         setInterval(fetchStatus, 500);
@@ -526,6 +590,9 @@ def index():
 @app.route('/api/status')
 def api_status():
     global trader, ws_client, is_trading, config
+
+    # Check if we need to log daily balance
+    check_daily_balance_log()
 
     default_state = {
         "round_number": 1, "bet_number": 1, "cumulative_loss_this_round": 0,
@@ -606,6 +673,28 @@ def api_stop():
     is_trading = False
     log_activity("Stop requested...")
     return jsonify({"status": "stopping"})
+
+
+@app.route('/api/set_base_bet', methods=['POST'])
+def api_set_base_bet():
+    global trader, config
+
+    data = request.get_json()
+    base_bet = data.get('base_bet', 1.0)
+
+    if base_bet < 0.25 or base_bet > 100:
+        return jsonify({"status": "error", "message": "Base bet must be between $0.25 and $100"}), 400
+
+    # Update config
+    if config:
+        config.stink.base_bet_dollars = base_bet
+
+    # Update trader
+    if trader:
+        trader.stink.base_bet_dollars = base_bet
+
+    log_activity(f"Base bet set to ${base_bet:.2f}")
+    return jsonify({"status": "ok", "base_bet": base_bet})
 
 
 def main():

@@ -197,10 +197,16 @@ class KalshiWebSocket:
 
     async def subscribe(self, ticker: str) -> bool:
         """Subscribe to orderbook updates for a market."""
-        if not self.ws or not self._connected:
+        if not self.ws:
+            print(f"💩 Cannot subscribe to {ticker}: no websocket")
+            return False
+
+        if not self._connected:
+            print(f"💩 Cannot subscribe to {ticker}: not connected")
             return False
 
         if ticker in self.subscribed_tickers:
+            print(f"💩 Already subscribed to {ticker}")
             return True
 
         try:
@@ -214,6 +220,7 @@ class KalshiWebSocket:
                 }
             }
 
+            print(f"💩 Sending subscribe for {ticker}: {json.dumps(msg)}")
             await self.ws.send(json.dumps(msg))
             self.subscribed_tickers.add(ticker)
 
@@ -226,6 +233,8 @@ class KalshiWebSocket:
 
         except Exception as e:
             print(f"💩 Subscribe failed for {ticker}: {e}")
+            import traceback
+            traceback.print_exc()
             return False
 
     async def unsubscribe(self, ticker: str) -> bool:
@@ -304,12 +313,18 @@ class KalshiWebSocket:
 
             msg_type = data.get("type", "")
 
+            # Log first few messages for debugging
+            if self._message_count <= 5:
+                print(f"💩 WS msg #{self._message_count}: type={msg_type}, keys={list(data.keys())}")
+
             if msg_type in ("orderbook_snapshot", "orderbook_delta"):
                 msg = data.get("msg", {})
                 ticker = msg.get("market_ticker", "")
 
                 if ticker:
                     ob = self._parse_orderbook_data(msg, ticker)
+                    if self._message_count <= 10:
+                        print(f"💩 Orderbook update: {ticker} NO_ask={ob.no_ask}¢")
 
                     if self.on_orderbook_update:
                         self.on_orderbook_update(ob)
@@ -320,13 +335,19 @@ class KalshiWebSocket:
                 self.last_error = error_msg
 
             elif msg_type == "subscribed":
-                # Subscription confirmed
-                pass
+                print(f"💩 Subscription confirmed: {data}")
+
+            elif msg_type == "":
+                # Could be a response to our command
+                if "id" in data:
+                    print(f"💩 Response to cmd {data.get('id')}: {data}")
 
         except json.JSONDecodeError:
-            pass
+            print(f"💩 Invalid JSON: {raw[:100]}")
         except Exception as e:
             print(f"💩 Message parse error: {e}")
+            import traceback
+            traceback.print_exc()
 
     async def run(self):
         """Main WebSocket loop with auto-reconnect."""
