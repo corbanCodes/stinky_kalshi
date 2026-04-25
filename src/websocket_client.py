@@ -324,28 +324,18 @@ class KalshiWebSocket:
                 print(f"💩 DELTA {side}: price_raw={price_raw} -> {price}¢, delta={delta}")
 
             if side == "yes" and 1 <= price <= 99:
-                # Update or add the level
-                found = False
-                for level in ob.yes_bids:
-                    if level.price == price:
-                        level.quantity = max(0, level.quantity + delta)
-                        found = True
-                        break
-                if not found and delta > 0:
+                # Delta is the NEW quantity at this price level (not a change)
+                # Remove existing level at this price
+                ob.yes_bids = [l for l in ob.yes_bids if l.price != price]
+                # Add new level if quantity > 0
+                if delta > 0:
                     ob.yes_bids.append(OrderbookLevel(price=price, quantity=delta))
-                # Remove zero-quantity levels
-                ob.yes_bids = [l for l in ob.yes_bids if l.quantity > 0]
 
             elif side == "no" and 1 <= price <= 99:
-                found = False
-                for level in ob.no_bids:
-                    if level.price == price:
-                        level.quantity = max(0, level.quantity + delta)
-                        found = True
-                        break
-                if not found and delta > 0:
+                # Delta is the NEW quantity at this price level (not a change)
+                ob.no_bids = [l for l in ob.no_bids if l.price != price]
+                if delta > 0:
                     ob.no_bids.append(OrderbookLevel(price=price, quantity=delta))
-                ob.no_bids = [l for l in ob.no_bids if l.quantity > 0]
 
         else:
             # Snapshot format: full orderbook replacement
