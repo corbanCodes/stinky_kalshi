@@ -173,13 +173,25 @@ class KalshiClient:
         return MarketData.from_api(data)
 
     def get_btc_15min_markets(self) -> list[MarketData]:
-        """Get BTC 15-minute markets (all statuses for debugging)."""
-        # Fetch without status filter to see all markets
-        params = {"series_ticker": "KXBTC15M", "limit": 100}
-        data = self._request("GET", "/markets", params=params)
+        """Get BTC 15-minute markets - both open and upcoming."""
         markets = []
-        for m in data.get("markets", []):
+
+        # First get OPEN markets (currently tradeable)
+        open_params = {"series_ticker": "KXBTC15M", "status": "open", "limit": 50}
+        open_data = self._request("GET", "/markets", params=open_params)
+        for m in open_data.get("markets", []):
             markets.append(MarketData.from_api(m))
+
+        # Also get upcoming (initialized) markets for visibility
+        upcoming_params = {"series_ticker": "KXBTC15M", "status": "unopened", "limit": 20}
+        try:
+            upcoming_data = self._request("GET", "/markets", params=upcoming_params)
+            for m in upcoming_data.get("markets", []):
+                markets.append(MarketData.from_api(m))
+        except:
+            pass
+
+        print(f"💩 API returned: {len(open_data.get('markets', []))} open, {len(markets)} total")
         return markets
 
     # ========== Orders ==========

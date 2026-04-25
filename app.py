@@ -96,59 +96,40 @@ async def refresh_market_subscriptions():
         markets = rest_client.get_btc_15min_markets()
 
         # Use time-based filtering - check if market is currently tradeable
-        from datetime import datetime, timezone, timedelta
+        from datetime import datetime, timezone
         now = datetime.now(timezone.utc)
 
-        # On first fetch, log detailed timing info
+        # Log what we found
         if len(ws_client.subscribed_tickers) == 0 and markets:
-            log_activity(f"Current UTC time: {now.isoformat()}")
-            # Show closest markets by time
-            timed_markets = []
-            for m in markets[:20]:
-                if m.open_time and m.close_time:
-                    try:
-                        open_dt = datetime.fromisoformat(m.open_time.replace('Z', '+00:00'))
-                        close_dt = datetime.fromisoformat(m.close_time.replace('Z', '+00:00'))
-                        diff = (open_dt - now).total_seconds()
-                        timed_markets.append((m, open_dt, close_dt, diff))
-                    except:
-                        pass
+            active_count = sum(1 for m in markets if m.status in ("active", "open"))
+            log_activity(f"Found {len(markets)} markets ({active_count} active) at {now.strftime('%H:%M:%S UTC')}")
 
-            timed_markets.sort(key=lambda x: abs(x[3]))
-            for m, open_dt, close_dt, diff in timed_markets[:5]:
-                status_emoji = "✅" if m.is_currently_active() else "⏳"
-                log_activity(f"  {status_emoji} {m.ticker}: open={open_dt.strftime('%H:%M')} close={close_dt.strftime('%H:%M')} (diff={diff/60:.1f}min)")
-
-        active_markets = [m for m in markets if m.is_currently_active()]
-
-        # Also include markets that WILL be active soon (next 2 minutes) for upcoming windows
-        upcoming_cutoff = now + timedelta(minutes=2)
-
-        for m in markets:
-            if m not in active_markets and m.open_time:
-                try:
-                    open_dt = datetime.fromisoformat(m.open_time.replace('Z', '+00:00'))
-                    if now <= open_dt <= upcoming_cutoff:
-                        active_markets.append(m)
-                except:
-                    pass
+        # Filter for active/open markets (API should return these with status=open query)
+        active_markets = [m for m in markets if m.status in ("active", "open") or m.is_currently_active()]
 
         active_tickers = {m.ticker for m in active_markets}
 
-        # Log status summary (not every market)
-        status_counts = {}
-        for m in markets:
-            status_counts[m.status] = status_counts.get(m.status, 0) + 1
-
-        log_activity(f"Markets: {len(markets)} total, {len(active_tickers)} active/upcoming. Statuses: {status_counts}")
-
-        # Log the active ones
+        # Log summary
         if active_markets:
-            for m in active_markets[:5]:  # Log first 5 max
-                log_activity(f"  Active: {m.ticker} open={m.open_time} close={m.close_time}")
+            log_activity(f"Found {len(active_markets)} active markets")
+            for m in active_markets[:3]:
+                log_activity(f"  {m.ticker} status={m.status} no_ask={m.no_ask}¢")
 
         if not active_tickers:
-            # No active markets - this is normal between trading windows
+            # No active markets - find when next one opens
+            if markets:
+                next_open = None
+                for m in markets:
+                    if m.open_time:
+                        try:
+                            open_dt = datetime.fromisoformat(m.open_time.replace('Z', '+00:00'))
+                            if open_dt > now and (next_open is None or open_dt < next_open):
+                                next_open = open_dt
+                        except:
+                            pass
+                if next_open:
+                    mins_until = (next_open - now).total_seconds() / 60
+                    log_activity(f"No active markets. Next opens in {mins_until:.0f} min ({next_open.strftime('%H:%M UTC')})")
             return
 
         # Unsubscribe from closed markets
@@ -500,6 +481,7 @@ HTML_TEMPLATE = """
                 <div>Uptime: <span id="uptime">0s</span></div>
                 <div>🎯 Stinky: <span id="stinkyCnt">0</span></div>
             </div>
+            <div id="nextOpen" style="color:#ffaa00;font-size:0.85em;margin-bottom:8px;display:none;"></div>
             <div class="ob-grid" id="orderbooks">
                 <p style="color:#555;grid-column:1/-1">Connecting...</p>
             </div>
@@ -579,6 +561,15 @@ HTML_TEMPLATE = """
             document.getElementById('uptime').textContent = Math.floor(d.ws.uptime_seconds) + 's';
             document.getElementById('stinkyCnt').textContent = d.stinky_count;
 
+            // Next market open indicator
+            const nextOpenEl = document.getElementById('nextOpen');
+            if (d.ws.next_market_open && (!d.orderbooks || d.orderbooks.length === 0)) {
+                nextOpenEl.textContent = '⏰ Next market opens in: ' + d.ws.next_market_open;
+                nextOpenEl.style.display = 'block';
+            } else {
+                nextOpenEl.style.display = 'none';
+            }
+
             // Orderbooks
             const obEl = document.getElementById('orderbooks');
             if (d.orderbooks && d.orderbooks.length > 0) {
@@ -596,9 +587,13 @@ HTML_TEMPLATE = """
                     </div>`;
                 }).join('');
             } else {
-                obEl.innerHTML = d.ws.connected
-                    ? '<p style="color:#555;grid-column:1/-1">Waiting for data...</p>'
-                    : '<p style="color:#555;grid-column:1/-1">Disconnected</p>';
+                if (!d.ws.connected) {
+                    obEl.innerHTML = '<p style="color:#555;grid-column:1/-1">Disconnected</p>';
+                } else if (d.ws.next_market_open) {
+                    obEl.innerHTML = '<p style="color:#555;grid-column:1/-1">No active markets - waiting for next trading window</p>';
+                } else {
+                    obEl.innerHTML = '<p style="color:#555;grid-column:1/-1">Waiting for data...</p>';
+                }
             }
 
             // Log
@@ -650,11 +645,32 @@ def api_status():
 
     ws_status = {
         "connected": False, "subscribed_count": 0, "message_count": 0,
-        "last_message_age": 9999, "uptime_seconds": 0,
+        "last_message_age": 9999, "uptime_seconds": 0, "next_market_open": None,
     }
 
     orderbooks = []
     stinky_count = 0
+
+    # Check for next market open time if no active markets
+    if rest_client and (not ws_client or len(ws_client.subscribed_tickers) == 0):
+        try:
+            from datetime import datetime, timezone
+            now = datetime.now(timezone.utc)
+            markets = rest_client.get_btc_15min_markets()
+            next_open = None
+            for m in markets:
+                if m.open_time:
+                    try:
+                        open_dt = datetime.fromisoformat(m.open_time.replace('Z', '+00:00'))
+                        if open_dt > now and (next_open is None or open_dt < next_open):
+                            next_open = open_dt
+                    except:
+                        pass
+            if next_open:
+                mins_until = (next_open - now).total_seconds() / 60
+                ws_status["next_market_open"] = f"{mins_until:.0f}min ({next_open.strftime('%H:%M UTC')})"
+        except:
+            pass
 
     if ws_client:
         ws_status = ws_client.get_status()
