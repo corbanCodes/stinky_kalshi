@@ -311,8 +311,17 @@ class KalshiWebSocket:
             price_raw = data.get("price_dollars", 0)
             delta_raw = data.get("delta_fp", 0)
 
-            price = int(float(price_raw) * 100) if price_raw else 0
+            # Convert price - same logic as snapshots
+            price_float = float(price_raw) if price_raw else 0
+            if price_float < 1:
+                price = int(price_float * 100)
+            else:
+                price = int(price_float)
             delta = int(float(delta_raw)) if delta_raw else 0
+
+            # Debug first few deltas
+            if ob.update_count < 10:
+                print(f"💩 DELTA {side}: price_raw={price_raw} -> {price}¢, delta={delta}")
 
             if side == "yes" and 1 <= price <= 99:
                 # Update or add the level
@@ -384,6 +393,10 @@ class KalshiWebSocket:
         ob.update_count += 1
         self.orderbooks[ticker] = ob
 
+        # Periodic state logging (every 100 updates)
+        if ob.update_count % 100 == 0:
+            print(f"💩 STATE [{ticker}] update #{ob.update_count}: YES_ask={ob.yes_ask}¢ NO_ask={ob.no_ask}¢ sum={(ob.yes_ask or 0)+(ob.no_ask or 0)}¢ (yes_bids={len(ob.yes_bids)} no_bids={len(ob.no_bids)})")
+
         return ob
 
     async def _handle_message(self, raw: str):
@@ -404,21 +417,17 @@ class KalshiWebSocket:
                 ticker = msg.get("market_ticker", "")
                 is_delta = (msg_type == "orderbook_delta")
 
-                # Debug: show full message structure for first snapshot
-                if msg_type == "orderbook_snapshot" and self._message_count <= 3:
-                    print(f"💩 SNAPSHOT MSG KEYS: {list(msg.keys())}")
-                    # Check if orderbook data is nested
-                    if "orderbook" in msg:
-                        print(f"💩 SNAPSHOT orderbook keys: {list(msg['orderbook'].keys())}")
-                    # Show first bit of each key
+                # Debug: show full message structure for first few messages
+                if self._message_count <= 5:
+                    print(f"💩 {msg_type.upper()} MSG KEYS: {list(msg.keys())}")
                     for k, v in msg.items():
                         if k != "market_ticker":
                             if isinstance(v, list) and v:
-                                print(f"💩 SNAPSHOT {k} (list len={len(v)}): first={v[0]}")
+                                print(f"💩 {msg_type.upper()} {k} (list len={len(v)}): first={v[0]}")
                             elif isinstance(v, dict):
-                                print(f"💩 SNAPSHOT {k} (dict): keys={list(v.keys())}")
+                                print(f"💩 {msg_type.upper()} {k} (dict): keys={list(v.keys())}")
                             else:
-                                print(f"💩 SNAPSHOT {k}: {v}")
+                                print(f"💩 {msg_type.upper()} {k}: {v}")
 
                 if ticker:
                     # For snapshots, orderbook data might be nested under 'orderbook' key
