@@ -149,8 +149,10 @@ class KalshiClient:
         return MarketData.from_api(data)
 
     def get_btc_15min_markets(self) -> list[MarketData]:
-        """Get all open BTC 15-minute markets."""
-        data = self.get_markets(series_ticker="KXBTC15M")
+        """Get BTC 15-minute markets (all statuses for debugging)."""
+        # Fetch without status filter to see all markets
+        params = {"series_ticker": "KXBTC15M", "limit": 100}
+        data = self._request("GET", "/markets", params=params)
         markets = []
         for m in data.get("markets", []):
             markets.append(MarketData.from_api(m))

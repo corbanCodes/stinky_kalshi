@@ -97,11 +97,16 @@ async def refresh_market_subscriptions():
         markets = rest_client.get_btc_15min_markets()
         log_activity(f"Found {len(markets)} total markets")
 
-        active_tickers = {m.ticker for m in markets if m.status == "open"}
-        log_activity(f"Found {len(active_tickers)} open markets")
+        # Log each market's status for debugging
+        for m in markets:
+            log_activity(f"  Market: {m.ticker} status={m.status} no_ask={m.no_ask}¢")
+
+        # Accept "open" or "active" status
+        active_tickers = {m.ticker for m in markets if m.status in ("open", "active", "trading")}
+        log_activity(f"Found {len(active_tickers)} tradeable markets")
 
         if not active_tickers:
-            log_activity("No open BTC 15-min markets found", "loss")
+            log_activity("No tradeable BTC 15-min markets found")
             return
 
         # Unsubscribe from closed markets
