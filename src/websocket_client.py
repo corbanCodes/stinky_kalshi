@@ -268,35 +268,59 @@ class KalshiWebSocket:
         """
         Parse orderbook snapshot or delta.
 
-        Format: {"yes": [[price, qty], ...], "no": [[price, qty], ...]}
-        Prices are in cents (integers), quantities are integers.
+        Kalshi format: {"orderbook": {"yes": [[price, qty], ...], "no": [[price, qty], ...]}}
+        Or directly: {"yes": [[price, qty], ...], "no": [[price, qty], ...]}
         """
         ob = self.orderbooks.get(ticker, Orderbook(ticker=ticker))
 
-        # Parse YES bids
-        if "yes" in data:
-            yes_data = data["yes"]
-            if isinstance(yes_data, list):
-                # Full snapshot: replace all
-                ob.yes_bids = []
-                for level in yes_data:
-                    if len(level) >= 2:
-                        price = int(float(level[0]) * 100) if isinstance(level[0], str) and '.' in level[0] else int(level[0])
-                        qty = int(float(level[1])) if isinstance(level[1], str) else int(level[1])
-                        if qty > 0:
-                            ob.yes_bids.append(OrderbookLevel(price=price, quantity=qty))
+        # Debug: log the data structure for first few updates
+        if ob.update_count < 3:
+            print(f"💩 DEBUG orderbook data keys: {list(data.keys())}")
+            if "orderbook" in data:
+                print(f"💩 DEBUG orderbook inner keys: {list(data['orderbook'].keys())}")
+
+        # Handle nested "orderbook" key
+        orderbook_data = data.get("orderbook", data)
+
+        def parse_levels(levels_data) -> list[OrderbookLevel]:
+            """Parse price levels from various formats."""
+            result = []
+            if not isinstance(levels_data, list):
+                return result
+
+            for level in levels_data:
+                if len(level) >= 2:
+                    # Handle both cents (int) and dollars (float/string)
+                    price_raw = level[0]
+                    qty_raw = level[1]
+
+                    # Convert price to cents
+                    if isinstance(price_raw, str):
+                        price = int(float(price_raw) * 100) if '.' in price_raw else int(price_raw)
+                    elif isinstance(price_raw, float):
+                        price = int(price_raw * 100) if price_raw < 1.01 else int(price_raw)
+                    else:
+                        price = int(price_raw)
+
+                    # Convert quantity
+                    qty = int(float(qty_raw)) if isinstance(qty_raw, str) else int(qty_raw)
+
+                    if qty > 0 and 1 <= price <= 99:
+                        result.append(OrderbookLevel(price=price, quantity=qty))
+
+            return result
+
+        # Parse YES bids (check multiple possible keys)
+        for key in ["yes", "yes_dollars", "bids"]:
+            if key in orderbook_data:
+                ob.yes_bids = parse_levels(orderbook_data[key])
+                break
 
         # Parse NO bids
-        if "no" in data:
-            no_data = data["no"]
-            if isinstance(no_data, list):
-                ob.no_bids = []
-                for level in no_data:
-                    if len(level) >= 2:
-                        price = int(float(level[0]) * 100) if isinstance(level[0], str) and '.' in level[0] else int(level[0])
-                        qty = int(float(level[1])) if isinstance(level[1], str) else int(level[1])
-                        if qty > 0:
-                            ob.no_bids.append(OrderbookLevel(price=price, quantity=qty))
+        for key in ["no", "no_dollars"]:
+            if key in orderbook_data:
+                ob.no_bids = parse_levels(orderbook_data[key])
+                break
 
         ob.last_update = time.time()
         ob.update_count += 1
