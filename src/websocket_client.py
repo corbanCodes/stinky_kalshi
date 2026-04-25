@@ -1,18 +1,14 @@
 """
-💩 Kalshi WebSocket client for real-time orderbook 💩
+💩 Kalshi WebSocket Client - REAL-TIME ORDERBOOK 💩
 
-The orderbook shows all open orders at different price levels:
+Proper implementation based on Kalshi docs:
+- Auth via headers during WebSocket handshake
+- Subscribe to orderbook_delta channel per market
+- Orderbook format: yes/no arrays of [price, quantity]
+- NO ask = 100 - YES bid (binary market relationship)
 
-    NO SIDE (what we want to BUY)
-    ─────────────────────────────
-    SELL @ 15¢  [500 contracts]  ← Best ask (we buy here)
-    SELL @ 14¢  [200 contracts]
-    SELL @ 13¢  [50 contracts]
-    ───────────────────────────
-    BUY @ 12¢   [300 contracts]  ← Best bid
-    BUY @ 11¢   [400 contracts]
-
-When we see NO ask ≤ our target (10-15¢), we buy!
+https://docs.kalshi.com/getting_started/quick_start_websockets
+https://docs.kalshi.com/getting_started/orderbook_responses
 """
 
 import asyncio
@@ -20,6 +16,7 @@ import json
 import time
 from typing import Callable, Optional
 from dataclasses import dataclass, field
+from datetime import datetime
 
 import websockets
 
@@ -29,69 +26,108 @@ from .config import KalshiConfig
 
 @dataclass
 class OrderbookLevel:
-    """Single price level in orderbook."""
-    price: int  # cents
-    quantity: int  # contracts available
+    """Single price level: price in cents, quantity in contracts."""
+    price: int
+    quantity: int
 
 
 @dataclass
 class Orderbook:
     """
-    💩 Orderbook snapshot 💩
+    💩 Live Orderbook State 💩
 
-    For stink theory, we care about NO asks (prices to buy NO contracts).
-    We want the lowest NO ask price.
+    Kalshi only provides BIDS. In binary markets:
+    - YES bid @ 85¢ = NO ask @ 15¢ (you can BUY NO at 15¢)
+    - NO bid @ 15¢ = YES ask @ 85¢ (you can BUY YES at 85¢)
+
+    For stink theory: We want lowest NO ask = 100 - highest YES bid
     """
     ticker: str
-    yes_bids: list[OrderbookLevel] = field(default_factory=list)
-    yes_asks: list[OrderbookLevel] = field(default_factory=list)
-    no_bids: list[OrderbookLevel] = field(default_factory=list)
-    no_asks: list[OrderbookLevel] = field(default_factory=list)
-    timestamp: float = 0.0
+    yes_bids: list[OrderbookLevel] = field(default_factory=list)  # Sorted ascending
+    no_bids: list[OrderbookLevel] = field(default_factory=list)   # Sorted ascending
+    last_update: float = 0.0
+    update_count: int = 0
 
     @property
-    def best_no_ask(self) -> Optional[int]:
-        """💩 Best (lowest) price to buy NO contracts 💩"""
-        if not self.no_asks:
+    def best_yes_bid(self) -> Optional[int]:
+        """Highest YES bid price (last in sorted list)."""
+        if not self.yes_bids:
             return None
-        return min(level.price for level in self.no_asks)
+        return max(l.price for l in self.yes_bids)
 
     @property
-    def best_no_ask_quantity(self) -> int:
-        """Quantity available at best NO ask."""
-        if not self.no_asks:
+    def best_no_bid(self) -> Optional[int]:
+        """Highest NO bid price."""
+        if not self.no_bids:
+            return None
+        return max(l.price for l in self.no_bids)
+
+    @property
+    def no_ask(self) -> Optional[int]:
+        """
+        💩 THE KEY METRIC: Price to BUY NO contracts 💩
+        NO ask = 100 - best YES bid
+        """
+        best_yes = self.best_yes_bid
+        if best_yes is None:
+            return None
+        return 100 - best_yes
+
+    @property
+    def yes_ask(self) -> Optional[int]:
+        """Price to BUY YES contracts = 100 - best NO bid."""
+        best_no = self.best_no_bid
+        if best_no is None:
+            return None
+        return 100 - best_no
+
+    @property
+    def no_ask_quantity(self) -> int:
+        """Quantity available at best NO ask (= quantity at best YES bid)."""
+        if not self.yes_bids:
             return 0
-        best_price = self.best_no_ask
-        return sum(l.quantity for l in self.no_asks if l.price == best_price)
+        best_price = self.best_yes_bid
+        return sum(l.quantity for l in self.yes_bids if l.price == best_price)
 
-    @property
-    def best_yes_ask(self) -> Optional[int]:
-        """Best (lowest) price to buy YES contracts."""
-        if not self.yes_asks:
-            return None
-        return min(level.price for level in self.yes_asks)
+    def is_stinky(self, min_price: int = 5, max_price: int = 20) -> bool:
+        """💩 Is this a stinky opportunity? NO ask in target range."""
+        ask = self.no_ask
+        return ask is not None and min_price <= ask <= max_price
 
-    def is_stinky_opportunity(self, max_price: int = 15) -> bool:
-        """💩 Check if there's a stinky opportunity (NO ask ≤ target) 💩"""
-        best = self.best_no_ask
-        return best is not None and best <= max_price
+    def to_dict(self) -> dict:
+        """Convert to JSON-serializable dict."""
+        return {
+            "ticker": self.ticker,
+            "no_ask": self.no_ask,
+            "yes_ask": self.yes_ask,
+            "best_yes_bid": self.best_yes_bid,
+            "best_no_bid": self.best_no_bid,
+            "no_ask_quantity": self.no_ask_quantity,
+            "yes_bids": [[l.price, l.quantity] for l in self.yes_bids],
+            "no_bids": [[l.price, l.quantity] for l in self.no_bids],
+            "last_update": self.last_update,
+            "update_count": self.update_count,
+        }
 
 
 class KalshiWebSocket:
     """
-    💩 WebSocket client for real-time Kalshi data 💩
+    💩 Real-time WebSocket Client 💩
 
-    Subscribes to orderbook updates for BTC 15-min markets.
-    Calls your callback when orderbook changes.
+    - Connects with header-based auth
+    - Subscribes to orderbook_delta per market
+    - Maintains live orderbook state
+    - Calls callback on every update
     """
 
-    WS_URL = "wss://api.elections.kalshi.com/trade-api/ws/v2"
+    PROD_URL = "wss://api.elections.kalshi.com/trade-api/ws/v2"
+    DEMO_URL = "wss://demo-api.kalshi.co/trade-api/ws/v2"
 
     def __init__(
         self,
         config: KalshiConfig,
         on_orderbook_update: Callable[[Orderbook], None] = None,
-        on_market_update: Callable[[dict], None] = None,
+        on_connection_change: Callable[[bool, str], None] = None,
     ):
         self.config = config
         self.auth = KalshiAuth(
@@ -100,194 +136,285 @@ class KalshiWebSocket:
             private_key_base64=config.private_key_base64,
         )
         self.on_orderbook_update = on_orderbook_update
-        self.on_market_update = on_market_update
+        self.on_connection_change = on_connection_change
 
         self.ws = None
         self.orderbooks: dict[str, Orderbook] = {}
         self.subscribed_tickers: set[str] = set()
         self._running = False
-        self._reconnect_delay = 1
+        self._connected = False
+        self._last_message_time = 0.0
+        self._message_count = 0
+        self._subscription_id = 1
 
-    def _get_auth_message(self) -> dict:
-        """Generate authentication message for websocket."""
-        timestamp = str(int(time.time() * 1000))
-        # For websocket, sign: timestamp + "GET" + "/trade-api/ws/v2"
+        # Connection state
+        self.connected_at: Optional[float] = None
+        self.last_error: Optional[str] = None
+
+        self.ws_url = self.DEMO_URL if config.environment == "demo" else self.PROD_URL
+
+    def _get_auth_headers(self) -> dict:
+        """Generate WebSocket auth headers."""
         headers = self.auth.get_auth_headers("GET", "/trade-api/ws/v2")
         return {
-            "id": 1,
-            "cmd": "login",
-            "params": {
-                "api_key": self.config.api_key_id,
-                "signature": headers["KALSHI-ACCESS-SIGNATURE"],
-                "timestamp": headers["KALSHI-ACCESS-TIMESTAMP"],
-            }
+            "KALSHI-ACCESS-KEY": self.config.api_key_id,
+            "KALSHI-ACCESS-SIGNATURE": headers["KALSHI-ACCESS-SIGNATURE"],
+            "KALSHI-ACCESS-TIMESTAMP": headers["KALSHI-ACCESS-TIMESTAMP"],
         }
 
-    async def connect(self):
-        """Connect to websocket and authenticate."""
-        print("💩 Connecting to Kalshi WebSocket...")
-
+    async def connect(self) -> bool:
+        """Connect to WebSocket with header auth."""
         try:
-            self.ws = await websockets.connect(self.WS_URL)
-            print("💩 Connected! Authenticating...")
+            print(f"💩 Connecting to {self.ws_url}...")
 
-            # Authenticate
-            auth_msg = self._get_auth_message()
-            await self.ws.send(json.dumps(auth_msg))
+            headers = self._get_auth_headers()
+            self.ws = await websockets.connect(
+                self.ws_url,
+                additional_headers=headers,
+                ping_interval=20,
+                ping_timeout=10,
+            )
 
-            # Wait for auth response
-            response = await self.ws.recv()
-            data = json.loads(response)
+            self._connected = True
+            self.connected_at = time.time()
+            self.last_error = None
+            print("💩 WebSocket connected and authenticated!")
 
-            if data.get("type") == "error":
-                raise Exception(f"Auth failed: {data}")
+            if self.on_connection_change:
+                self.on_connection_change(True, "Connected")
 
-            print("💩 Authenticated successfully!")
-            self._reconnect_delay = 1
             return True
 
         except Exception as e:
+            self._connected = False
+            self.last_error = str(e)
             print(f"💩 Connection failed: {e}")
+
+            if self.on_connection_change:
+                self.on_connection_change(False, str(e))
+
             return False
 
-    async def subscribe_orderbook(self, ticker: str):
-        """Subscribe to orderbook updates for a ticker."""
-        if not self.ws:
-            return
+    async def subscribe(self, ticker: str) -> bool:
+        """Subscribe to orderbook updates for a market."""
+        if not self.ws or not self._connected:
+            return False
 
         if ticker in self.subscribed_tickers:
-            return
+            return True
 
-        msg = {
-            "id": len(self.subscribed_tickers) + 10,
-            "cmd": "subscribe",
-            "params": {
-                "channels": ["orderbook_delta"],
-                "market_tickers": [ticker]
-            }
-        }
-
-        await self.ws.send(json.dumps(msg))
-        self.subscribed_tickers.add(ticker)
-        print(f"💩 Subscribed to orderbook: {ticker}")
-
-    async def subscribe_markets(self, tickers: list[str]):
-        """Subscribe to multiple market orderbooks."""
-        for ticker in tickers:
-            await self.subscribe_orderbook(ticker)
-            await asyncio.sleep(0.1)  # Rate limit
-
-    def _parse_orderbook(self, data: dict) -> Optional[Orderbook]:
-        """Parse orderbook message into Orderbook object."""
         try:
-            ticker = data.get("market_ticker") or data.get("ticker", "")
-            if not ticker:
-                return None
+            self._subscription_id += 1
+            msg = {
+                "id": self._subscription_id,
+                "cmd": "subscribe",
+                "params": {
+                    "channels": ["orderbook_delta"],
+                    "market_ticker": ticker
+                }
+            }
 
-            ob = self.orderbooks.get(ticker, Orderbook(ticker=ticker))
+            await self.ws.send(json.dumps(msg))
+            self.subscribed_tickers.add(ticker)
 
-            # Parse levels
-            if "yes" in data:
-                yes_data = data["yes"]
-                if "bids" in yes_data:
-                    ob.yes_bids = [
-                        OrderbookLevel(price=int(l[0]), quantity=int(l[1]))
-                        for l in yes_data["bids"]
-                    ]
-                if "asks" in yes_data:
-                    ob.yes_asks = [
-                        OrderbookLevel(price=int(l[0]), quantity=int(l[1]))
-                        for l in yes_data["asks"]
-                    ]
+            # Initialize empty orderbook
+            if ticker not in self.orderbooks:
+                self.orderbooks[ticker] = Orderbook(ticker=ticker)
 
-            if "no" in data:
-                no_data = data["no"]
-                if "bids" in no_data:
-                    ob.no_bids = [
-                        OrderbookLevel(price=int(l[0]), quantity=int(l[1]))
-                        for l in no_data["bids"]
-                    ]
-                if "asks" in no_data:
-                    ob.no_asks = [
-                        OrderbookLevel(price=int(l[0]), quantity=int(l[1]))
-                        for l in no_data["asks"]
-                    ]
-
-            ob.timestamp = time.time()
-            self.orderbooks[ticker] = ob
-            return ob
+            print(f"💩 Subscribed: {ticker}")
+            return True
 
         except Exception as e:
-            print(f"💩 Error parsing orderbook: {e}")
-            return None
+            print(f"💩 Subscribe failed for {ticker}: {e}")
+            return False
 
-    async def _handle_message(self, message: str):
-        """Handle incoming websocket message."""
+    async def unsubscribe(self, ticker: str) -> bool:
+        """Unsubscribe from a market."""
+        if not self.ws or ticker not in self.subscribed_tickers:
+            return False
+
         try:
-            data = json.loads(message)
+            self._subscription_id += 1
+            msg = {
+                "id": self._subscription_id,
+                "cmd": "unsubscribe",
+                "params": {
+                    "channels": ["orderbook_delta"],
+                    "market_ticker": ticker
+                }
+            }
+
+            await self.ws.send(json.dumps(msg))
+            self.subscribed_tickers.discard(ticker)
+            self.orderbooks.pop(ticker, None)
+
+            print(f"💩 Unsubscribed: {ticker}")
+            return True
+
+        except Exception as e:
+            print(f"💩 Unsubscribe failed: {e}")
+            return False
+
+    def _parse_orderbook_data(self, data: dict, ticker: str):
+        """
+        Parse orderbook snapshot or delta.
+
+        Format: {"yes": [[price, qty], ...], "no": [[price, qty], ...]}
+        Prices are in cents (integers), quantities are integers.
+        """
+        ob = self.orderbooks.get(ticker, Orderbook(ticker=ticker))
+
+        # Parse YES bids
+        if "yes" in data:
+            yes_data = data["yes"]
+            if isinstance(yes_data, list):
+                # Full snapshot: replace all
+                ob.yes_bids = []
+                for level in yes_data:
+                    if len(level) >= 2:
+                        price = int(float(level[0]) * 100) if isinstance(level[0], str) and '.' in level[0] else int(level[0])
+                        qty = int(float(level[1])) if isinstance(level[1], str) else int(level[1])
+                        if qty > 0:
+                            ob.yes_bids.append(OrderbookLevel(price=price, quantity=qty))
+
+        # Parse NO bids
+        if "no" in data:
+            no_data = data["no"]
+            if isinstance(no_data, list):
+                ob.no_bids = []
+                for level in no_data:
+                    if len(level) >= 2:
+                        price = int(float(level[0]) * 100) if isinstance(level[0], str) and '.' in level[0] else int(level[0])
+                        qty = int(float(level[1])) if isinstance(level[1], str) else int(level[1])
+                        if qty > 0:
+                            ob.no_bids.append(OrderbookLevel(price=price, quantity=qty))
+
+        ob.last_update = time.time()
+        ob.update_count += 1
+        self.orderbooks[ticker] = ob
+
+        return ob
+
+    async def _handle_message(self, raw: str):
+        """Process incoming WebSocket message."""
+        try:
+            data = json.loads(raw)
+            self._last_message_time = time.time()
+            self._message_count += 1
+
             msg_type = data.get("type", "")
 
-            if msg_type == "orderbook_snapshot" or msg_type == "orderbook_delta":
-                ob = self._parse_orderbook(data.get("msg", data))
-                if ob and self.on_orderbook_update:
-                    self.on_orderbook_update(ob)
+            if msg_type in ("orderbook_snapshot", "orderbook_delta"):
+                msg = data.get("msg", {})
+                ticker = msg.get("market_ticker", "")
 
-            elif msg_type == "market":
-                if self.on_market_update:
-                    self.on_market_update(data.get("msg", data))
+                if ticker:
+                    ob = self._parse_orderbook_data(msg, ticker)
+
+                    if self.on_orderbook_update:
+                        self.on_orderbook_update(ob)
 
             elif msg_type == "error":
-                print(f"💩 WebSocket error: {data}")
+                error_msg = data.get("msg", {}).get("msg", str(data))
+                print(f"💩 WebSocket error: {error_msg}")
+                self.last_error = error_msg
+
+            elif msg_type == "subscribed":
+                # Subscription confirmed
+                pass
 
         except json.JSONDecodeError:
             pass
         except Exception as e:
-            print(f"💩 Error handling message: {e}")
+            print(f"💩 Message parse error: {e}")
 
-    async def listen(self):
-        """Listen for websocket messages."""
+    async def run(self):
+        """Main WebSocket loop with auto-reconnect."""
         self._running = True
+        reconnect_delay = 1
 
         while self._running:
             try:
-                if not self.ws:
+                if not self._connected:
                     if not await self.connect():
-                        await asyncio.sleep(self._reconnect_delay)
-                        self._reconnect_delay = min(self._reconnect_delay * 2, 30)
+                        await asyncio.sleep(reconnect_delay)
+                        reconnect_delay = min(reconnect_delay * 2, 30)
                         continue
 
-                    # Resubscribe to tickers
+                    reconnect_delay = 1
+
+                    # Resubscribe to all tickers
                     for ticker in list(self.subscribed_tickers):
                         self.subscribed_tickers.discard(ticker)
-                        await self.subscribe_orderbook(ticker)
+                        await self.subscribe(ticker)
+                        await asyncio.sleep(0.05)
 
-                message = await self.ws.recv()
+                # Receive message
+                message = await asyncio.wait_for(self.ws.recv(), timeout=30)
                 await self._handle_message(message)
 
-            except websockets.exceptions.ConnectionClosed:
-                print("💩 WebSocket disconnected, reconnecting...")
+            except asyncio.TimeoutError:
+                # No message in 30s, connection might be stale
+                pass
+
+            except websockets.exceptions.ConnectionClosed as e:
+                print(f"💩 WebSocket closed: {e}")
+                self._connected = False
                 self.ws = None
-                await asyncio.sleep(self._reconnect_delay)
+
+                if self.on_connection_change:
+                    self.on_connection_change(False, f"Disconnected: {e}")
+
+                await asyncio.sleep(reconnect_delay)
 
             except Exception as e:
                 print(f"💩 WebSocket error: {e}")
+                self._connected = False
                 await asyncio.sleep(1)
 
-    async def close(self):
-        """Close websocket connection."""
+    async def stop(self):
+        """Stop the WebSocket client."""
         self._running = False
         if self.ws:
             await self.ws.close()
             self.ws = None
+        self._connected = False
 
-    def get_orderbook(self, ticker: str) -> Optional[Orderbook]:
-        """Get cached orderbook for a ticker."""
-        return self.orderbooks.get(ticker)
+        if self.on_connection_change:
+            self.on_connection_change(False, "Stopped")
 
-    def get_stinky_opportunities(self, max_price: int = 15) -> list[Orderbook]:
-        """💩 Get all tickers with NO ask ≤ target price 💩"""
-        opportunities = []
-        for ob in self.orderbooks.values():
-            if ob.is_stinky_opportunity(max_price):
-                opportunities.append(ob)
-        return opportunities
+    @property
+    def is_connected(self) -> bool:
+        return self._connected
+
+    @property
+    def message_count(self) -> int:
+        return self._message_count
+
+    @property
+    def last_message_age(self) -> float:
+        """Seconds since last message."""
+        if self._last_message_time == 0:
+            return float('inf')
+        return time.time() - self._last_message_time
+
+    def get_stinky_opportunities(self, min_price: int = 5, max_price: int = 20) -> list[Orderbook]:
+        """💩 Get all orderbooks with NO ask in target range 💩"""
+        return [
+            ob for ob in self.orderbooks.values()
+            if ob.is_stinky(min_price, max_price)
+        ]
+
+    def get_status(self) -> dict:
+        """Get WebSocket status for UI."""
+        return {
+            "connected": self._connected,
+            "url": self.ws_url,
+            "connected_at": datetime.fromtimestamp(self.connected_at).isoformat() if self.connected_at else None,
+            "uptime_seconds": time.time() - self.connected_at if self.connected_at else 0,
+            "subscribed_count": len(self.subscribed_tickers),
+            "subscribed_tickers": list(self.subscribed_tickers),
+            "message_count": self._message_count,
+            "last_message_age": self.last_message_age,
+            "last_error": self.last_error,
+        }
