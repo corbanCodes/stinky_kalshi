@@ -273,25 +273,32 @@ class KalshiWebSocket:
         """
         ob = self.orderbooks.get(ticker, Orderbook(ticker=ticker))
 
-        def parse_levels(levels_data) -> list[OrderbookLevel]:
+        def parse_levels(levels_data, side_name: str = "") -> list[OrderbookLevel]:
             """Parse price levels from [[price, qty], ...] format."""
             result = []
             if not isinstance(levels_data, list):
                 return result
 
-            for level in levels_data:
+            for i, level in enumerate(levels_data):
                 if len(level) >= 2:
                     price_raw = level[0]
                     qty_raw = level[1]
 
-                    # Convert price to cents (prices come as dollars like 0.45)
-                    if isinstance(price_raw, (str, float)):
-                        price = int(float(price_raw) * 100)
+                    # Convert price to cents
+                    # Prices < 1 are in dollars (0.45 = 45 cents)
+                    # Prices >= 1 are already in cents (45 = 45 cents)
+                    price_float = float(price_raw) if isinstance(price_raw, str) else price_raw
+                    if price_float < 1:
+                        price = int(price_float * 100)
                     else:
-                        price = int(price_raw)
+                        price = int(price_float)
 
                     # Convert quantity
                     qty = int(float(qty_raw)) if isinstance(qty_raw, str) else int(qty_raw)
+
+                    # Debug first few
+                    if i < 2 and ob.update_count < 2 and side_name:
+                        print(f"💩 PARSE {side_name}[{i}]: raw={price_raw} -> {price}¢, qty={qty}")
 
                     if qty > 0 and 1 <= price <= 99:
                         result.append(OrderbookLevel(price=price, quantity=qty))
@@ -333,16 +340,45 @@ class KalshiWebSocket:
 
         else:
             # Snapshot format: full orderbook replacement
+            # Debug: show all keys on first snapshot
+            if ob.update_count < 2:
+                print(f"💩 PARSE SNAPSHOT keys: {list(data.keys())}")
+
             # Check for yes_dollars_fp / no_dollars_fp keys
+            yes_found = False
             for key in ["yes_dollars_fp", "yes_dollars", "yes"]:
                 if key in data:
-                    ob.yes_bids = parse_levels(data[key])
+                    raw_data = data[key]
+                    ob.yes_bids = parse_levels(raw_data, "YES")
+                    yes_found = True
+                    if ob.update_count < 2:
+                        print(f"💩 PARSE YES using key='{key}' len={len(raw_data) if raw_data else 0}")
+                        if raw_data and len(raw_data) > 0:
+                            print(f"💩 PARSE YES first 3: {raw_data[:3]}")
+                        print(f"💩 PARSE YES best_bid={ob.best_yes_bid}¢ -> NO_ask={ob.no_ask}¢")
                     break
 
+            if not yes_found and ob.update_count < 2:
+                print(f"💩 PARSE WARNING: No YES key found!")
+
+            no_found = False
             for key in ["no_dollars_fp", "no_dollars", "no"]:
                 if key in data:
-                    ob.no_bids = parse_levels(data[key])
+                    raw_data = data[key]
+                    ob.no_bids = parse_levels(raw_data, "NO")
+                    no_found = True
+                    if ob.update_count < 2:
+                        print(f"💩 PARSE NO using key='{key}' len={len(raw_data) if raw_data else 0}")
+                        if raw_data and len(raw_data) > 0:
+                            print(f"💩 PARSE NO first 3: {raw_data[:3]}")
+                        print(f"💩 PARSE NO best_bid={ob.best_no_bid}¢ -> YES_ask={ob.yes_ask}¢")
                     break
+
+            if not no_found and ob.update_count < 2:
+                print(f"💩 PARSE WARNING: No NO key found!")
+
+            if ob.update_count < 2:
+                print(f"💩 PARSE FINAL: YES_ask={ob.yes_ask}¢ + NO_ask={ob.no_ask}¢ = {(ob.yes_ask or 0) + (ob.no_ask or 0)}¢")
 
         ob.last_update = time.time()
         ob.update_count += 1
@@ -368,10 +404,33 @@ class KalshiWebSocket:
                 ticker = msg.get("market_ticker", "")
                 is_delta = (msg_type == "orderbook_delta")
 
+                # Debug: show full message structure for first snapshot
+                if msg_type == "orderbook_snapshot" and self._message_count <= 3:
+                    print(f"💩 SNAPSHOT MSG KEYS: {list(msg.keys())}")
+                    # Check if orderbook data is nested
+                    if "orderbook" in msg:
+                        print(f"💩 SNAPSHOT orderbook keys: {list(msg['orderbook'].keys())}")
+                    # Show first bit of each key
+                    for k, v in msg.items():
+                        if k != "market_ticker":
+                            if isinstance(v, list) and v:
+                                print(f"💩 SNAPSHOT {k} (list len={len(v)}): first={v[0]}")
+                            elif isinstance(v, dict):
+                                print(f"💩 SNAPSHOT {k} (dict): keys={list(v.keys())}")
+                            else:
+                                print(f"💩 SNAPSHOT {k}: {v}")
+
                 if ticker:
-                    ob = self._parse_orderbook_data(msg, ticker, is_delta=is_delta)
+                    # For snapshots, orderbook data might be nested under 'orderbook' key
+                    # For deltas, the data is at the msg level
+                    if is_delta:
+                        orderbook_data = msg
+                    else:
+                        orderbook_data = msg.get("orderbook", msg)
+
+                    ob = self._parse_orderbook_data(orderbook_data, ticker, is_delta=is_delta)
                     if self._message_count <= 10:
-                        print(f"💩 Orderbook {msg_type}: {ticker} NO_ask={ob.no_ask}¢ yes_bids={len(ob.yes_bids)}")
+                        print(f"💩 Orderbook {msg_type}: {ticker} NO_ask={ob.no_ask}¢ YES_ask={ob.yes_ask}¢ yes_bids={len(ob.yes_bids)} no_bids={len(ob.no_bids)}")
 
                     if self.on_orderbook_update:
                         self.on_orderbook_update(ob)
