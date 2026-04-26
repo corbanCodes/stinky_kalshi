@@ -2,8 +2,8 @@
 2-Stage Recovery Martingale System
 
 A "safe" betting system that:
-- Enters at 80-87c with 5 minutes or less remaining
-- Stage 1 + 2 recovery capped at 87c (90c with 3c slippage)
+- Enters at 80-92c anytime during the market (backtested: max 2 consecutive losses)
+- Stage 1 + 2 recovery capped at 92c (95c with 3c slippage)
 - Two modes: Aggressive (50% Stage 2) and Conservative (20% Stage 2)
 - Uses WebSocket orderbook for fast entries
 
@@ -13,6 +13,11 @@ The System:
 - If Stage 1 loses -> Stage 2: Recover Base + Stage 1 + profit
 - If Stage 2 loses -> Give up, reset, start fresh
 - Any win -> Reset to Base and auto-compound
+
+Backtest Analysis (959k rows):
+- 80-92c @ anytime: 4192 opps, 88.5% win, MAX 2 consecutive losses
+- 80-87c @ anytime: 4095 opps, 87.1% win, MAX 3 consecutive losses
+- Waiting for last 5 min actually INCREASES max losses (up to 4)
 """
 
 import json
@@ -91,8 +96,8 @@ class RecoveryCalculator:
     Calculator for 2-stage recovery betting.
 
     Entry conditions:
-    - All bets: 80-87c ask price (90c max with 3c slippage)
-    - 5 minutes or less remaining in the market
+    - All bets: 80-92c ask price (95c max with 3c slippage)
+    - Anytime during the market (no time restriction - backtested optimal)
 
     Modes:
     - Aggressive: Stage 2 = 50% of bankroll
@@ -102,9 +107,9 @@ class RecoveryCalculator:
     Recovery buffer: 5% over loss to ensure profit
     """
 
-    # Entry price limits
+    # Entry price limits (backtested: 80-92c @ anytime = max 2 consecutive losses)
     MIN_ENTRY_PRICE = 80  # cents
-    MAX_ENTRY_PRICE = 87  # cents (90c with 3c slippage)
+    MAX_ENTRY_PRICE = 92  # cents (95c with 3c slippage)
 
     # Slippage allowance
     SLIPPAGE_CENTS = 3
@@ -279,7 +284,8 @@ class RecoveryCalculator:
     def is_valid_entry(self, price_cents: int, minutes_remaining: float) -> bool:
         """Check if entry conditions are met."""
         price_ok = self.MIN_ENTRY_PRICE <= price_cents <= self.MAX_ENTRY_PRICE
-        time_ok = 0.5 <= minutes_remaining <= 5.0
+        # No time restriction - backtesting shows "anytime" has fewer max consecutive losses
+        time_ok = 0.5 <= minutes_remaining <= 15.0
         return price_ok and time_ok
 
     def get_sizing_summary(self, bankroll: float) -> dict:

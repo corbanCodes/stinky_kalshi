@@ -1,14 +1,15 @@
 """
 2-Stage Recovery Martingale Trader
 
-Uses WebSocket orderbook for fast entries at 80-87c with 5 minutes remaining.
+Uses WebSocket orderbook for fast entries at 80-92c anytime.
 Two modes: Aggressive (50% S2) and Conservative (20% S2).
 
 Unlike Stink bets, this is a "safe" high-probability system:
-- Enters at 80-87c (high probability side)
+- Enters at 80-92c (high probability side) - backtested max 2 consecutive losses
 - Uses BTC direction to pick YES or NO
 - 2-stage recovery if base bet loses
 - Auto-compounds on wins
+- No time restriction ("anytime" has fewer max losses than "last 5 min")
 """
 
 import json
@@ -44,8 +45,13 @@ class RecoveryTrader:
     2-Stage Recovery Martingale Trader.
 
     Uses WebSocket orderbook for fast entries.
-    Entry: 80-87c ask, 5 minutes or less remaining.
+    Entry: 80-92c ask, anytime during the market.
     BTC > Strike = YES, BTC < Strike = NO.
+
+    Backtested parameters (959k rows):
+    - 80-92c @ anytime: max 2 consecutive losses
+    - 80-87c @ anytime: max 3 consecutive losses
+    - Waiting for last 5 min: max 4 consecutive losses (WORSE!)
     """
 
     def __init__(self, config: AppConfig = None):
@@ -82,8 +88,8 @@ class RecoveryTrader:
         print(f"  Balance: ${self.balance:.2f}")
         print(f"  Current Stage: {self.state.current_stage}")
         print(f"  Round: #{self.state.round_number}")
-        print(f"  Entry Range: 80-87c (90c with slippage)")
-        print(f"  Time Window: Last 5 minutes")
+        print(f"  Entry Range: 80-92c (95c with slippage)")
+        print(f"  Time Window: Anytime (backtested optimal)")
         print("=" * 60)
 
     def _load_history(self):
@@ -230,8 +236,9 @@ class RecoveryTrader:
 
                 minutes_remaining = (close_time - now).total_seconds() / 60
 
-                # Must be in last 5 minutes
-                if minutes_remaining < 0.5 or minutes_remaining > 5.0:
+                # Anytime is fine - backtesting shows this is optimal
+                # Just need at least 30 seconds to get filled
+                if minutes_remaining < 0.5 or minutes_remaining > 15.0:
                     continue
 
                 # Get floor strike
@@ -361,8 +368,8 @@ class RecoveryTrader:
 
         # Calculate limit price (add slippage)
         limit_price = entry_price + self.slippage_cents
-        if limit_price > 90:
-            limit_price = 90  # Cap at 90c
+        if limit_price > 95:
+            limit_price = 95  # Cap at 95c (92c max entry + 3c slippage)
 
         # Estimate cost
         cost = contracts * (limit_price / 100)
